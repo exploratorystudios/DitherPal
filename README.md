@@ -21,7 +21,7 @@ A fast, feature-rich dithering desktop application built with PyQt6. Supports im
   </tr>
 </table>
 
-### Video
+### Video (Click to watch)
 
 <table>
   <tr>
