@@ -37,7 +37,7 @@ A fast, feature-rich dithering desktop application built with PyQt6. Supports im
       <a href="https://youtu.be/xMnGWsTfyyQ"><img src="https://img.youtube.com/vi/xMnGWsTfyyQ/maxresdefault.jpg" width="1280" height="720"></a>
     </td>
     <td>
-      <a href="https://youtu.be/2U1-oRuyZfI"><img src="https://img.youtube.com/vi/2U1-oRuyZfI/maxresdefault.jpg" width="1280" height="720"></a>
+      <a href="https://youtu.be/3B4rneGYVPo"><img src="https://img.youtube.com/vi/3B4rneGYVPo/maxresdefault.jpg" width="1280" height="720"></a>
     </td>
   </tr>
 </table>
