@@ -104,6 +104,144 @@ def extract_image_colors(image, num_colors=256):
             colors.append([intensity, intensity, intensity])
         return np.array(colors)
 
+def cel_shade_image(rgb, num_colors=12, outline_px=0):
+    """Cel-shade an RGB uint8 image: flat color bands plus dark outlines on object edges.
+    Runs before dithering, so the dither turns each flat band into its own even pattern.
+    outline_px is the outline width in image pixels (0 = no outlines)."""
+    try:
+        import cv2
+    except ImportError:
+        return rgb
+
+    # Work at up to 720 px on the short side - plenty for band shapes, and keeps it fast
+    height, width = rgb.shape[:2]
+    scale = min(1.0, 720 / min(height, width))
+    if scale < 1.0:
+        work = cv2.resize(rgb, (max(1, round(width * scale)), max(1, round(height * scale))),
+                          interpolation=cv2.INTER_AREA)
+    else:
+        work = rgb.copy()
+
+    # Edge-preserving smoothing flattens texture but keeps shapes
+    for _ in range(2):
+        work = cv2.bilateralFilter(work, 9, 40, 9)
+    lab_image = cv2.cvtColor(work, cv2.COLOR_RGB2LAB)
+    lab = lab_image.reshape(-1, 3).astype(np.float32)
+
+    # Deterministic k-means (strided sample, centers seeded across the lightness range)
+    # so the same picture - or consecutive video frames - get the same bands
+    sample = lab[::max(1, len(lab) // 20000)]
+    order = np.argsort(sample[:, 0])
+    centers = sample[order[np.linspace(0, len(order) - 1, num_colors).astype(int)]].copy()
+    for _ in range(10):
+        nearest = ((sample[:, None, :] - centers[None]) ** 2).sum(axis=2).argmin(axis=1)
+        for k in range(num_colors):
+            members = sample[nearest == k]
+            if len(members):
+                centers[k] = members.mean(axis=0)
+    labels = np.empty(len(lab), dtype=np.int32)
+    for start in range(0, len(lab), 200000):
+        chunk = lab[start:start + 200000]
+        labels[start:start + 200000] = ((chunk[:, None, :] - centers[None]) ** 2).sum(axis=2).argmin(axis=1)
+    # Median filter removes speckles so bands are clean shapes
+    labels = cv2.medianBlur(labels.reshape(work.shape[:2]).astype(np.uint8), 5)
+
+    # Averaging washes colors out; push chroma back up like a pixel artist's palette
+    centers[:, 1:] = np.clip(128 + (centers[:, 1:] - 128) * 1.25, 0, 255)
+    center_rgb = cv2.cvtColor(centers.astype(np.uint8)[None], cv2.COLOR_LAB2RGB)[0]
+    flat = center_rgb[labels].copy()
+
+    if outline_px > 0:
+        # Outline object edges (strong edges in the smoothed picture), not band boundaries
+        luma = lab_image[..., 0]
+        median = float(np.median(luma))
+        # Strict thresholds: only strong silhouettes, not shading boundaries or texture
+        edges = cv2.Canny(luma, max(40, median), min(255, 2.0 * median + 60))
+        # Drop short fragments from texture so only real contours remain
+        count, components, stats, _ = cv2.connectedComponentsWithStats(edges, connectivity=8)
+        min_length = max(24, min(work.shape[:2]) // 12)
+        keep = np.zeros(count, dtype=bool)
+        keep[1:] = stats[1:, cv2.CC_STAT_AREA] >= min_length
+        edges = keep[components]
+        line_width = max(1, round(outline_px * scale))
+        if line_width > 1:
+            edges = cv2.dilate(edges.astype(np.uint8), np.ones((line_width, line_width), np.uint8)).astype(bool)
+        # Darkened version of the underlying color rather than pure black
+        flat[edges] = (flat[edges] * 0.4).astype(np.uint8)
+
+    if scale < 1.0:
+        flat = cv2.resize(flat, (width, height), interpolation=cv2.INTER_NEAREST)
+    return flat
+
+def estimate_pixel_art_cells(rgb_array, keep_detail=0.89, regions=6, min_cells=80, max_cells=220):
+    """Pick how many art pixels go across the short side, from how detailed the picture is.
+
+    For each candidate grid, every region of the image is shrunk to that grid and blown back up,
+    and we measure how much of the region's variation survives:
+        retained(region) = 1 - mean((original - rebuilt)^2) / variance(original)
+    Regions are averaged weighted by their variance, so busy areas (faces, gears, text) matter
+    more than flat sky. The chunkiest grid whose weighted average keeps keep_detail of the
+    picture wins. keep_detail=0.89 lands a hand-tuned 571x761 photo at ~140 art pixels.
+    Returns (cells, retained_fraction)."""
+    luma = Image.fromarray(rgb_array.astype(np.uint8)).convert('L')
+    work = np.array(luma, dtype=np.float32)
+    height, width = work.shape
+    short = min(width, height)
+
+    region_slices = [(slice(ry * height // regions, (ry + 1) * height // regions),
+                      slice(rx * width // regions, (rx + 1) * width // regions))
+                     for ry in range(regions) for rx in range(regions)]
+    region_vars = np.array([work[sl].var() for sl in region_slices], dtype=np.float64) + 1e-3
+
+    retained = 0.0
+    for cells in range(min_cells, max_cells + 1, 8):
+        px_per_cell = short / cells
+        small = luma.resize((max(1, round(width / px_per_cell)), max(1, round(height / px_per_cell))),
+                            Image.Resampling.BOX)
+        rebuilt = np.array(small.resize((width, height), Image.Resampling.BILINEAR), dtype=np.float32)
+        region_retained = np.array([max(0.0, 1.0 - ((work[sl] - rebuilt[sl]) ** 2).mean() / var)
+                                    for sl, var in zip(region_slices, region_vars)])
+        retained = float((region_retained * region_vars).sum() / region_vars.sum())
+        if retained >= keep_detail:
+            return cells, retained
+    # Very fine detail (line art, hatching) never gets there; cap so it still reads as pixel art
+    return max_cells, retained
+
+def suggest_pixel_art_settings(rgb_array, width, height, target_cells=140):
+    """Pick hybrid grid settings that turn an image into pixel art.
+
+    Tuned from a hand-picked result (2x upscale, 85% pattern strength, 8-color RGB palette),
+    with the block size scaled so the art-pixel grid has about target_cells on the short side.
+    rgb_array can be a thumbnail; width/height are the full image size."""
+    pixels = rgb_array.astype(np.float32)
+
+    # Hasler-Susstrunk colorfulness: near zero for grayscale art, 40+ for colorful photos
+    rg = pixels[..., 0] - pixels[..., 1]
+    yb = 0.5 * (pixels[..., 0] + pixels[..., 1]) - pixels[..., 2]
+    colorfulness = np.hypot(rg.std(), yb.std()) + 0.3 * np.hypot(rg.mean(), yb.mean())
+
+    # Size art pixels so the grid has about target_cells on the short side
+    source_px_per_cell = max(2, round(min(width, height) / target_cells))
+
+    # 2x upscale gives each art pixel a finer checker texture; skip it for huge images
+    upsample = 2 if max(width, height) * 2 <= 6000 else 1
+
+    if colorfulness < 15:
+        # Grayscale source: the RGB palette would add rainbow fringes, use gray levels instead
+        color_mode, levels = "Black & White", 4
+    else:
+        color_mode, levels = "Full Color Spectrum", 2
+
+    return {
+        "upsample": upsample,
+        "block_size": source_px_per_cell * upsample,
+        "strength": 85,
+        "color_mode": color_mode,
+        "levels": levels,
+        "grid": (max(1, width // source_px_per_cell), max(1, height // source_px_per_cell)),
+        "colorfulness": colorfulness,
+    }
+
 def find_nearest_color(pixel, palette):
     """Find the nearest color in the palette to the given pixel"""
     distances = np.sqrt(np.sum((palette - pixel) ** 2, axis=1))
@@ -172,10 +310,11 @@ if NUMBA_AVAILABLE:
             next_error = np.zeros((width + 4, channels), dtype=np.float32)
             
             for x in range(width):
-                # Load pixel with accumulated error
+                # Load pixel with accumulated error, clamped so error can't run away
+                # when the image has colors outside the palette
                 pixel = np.empty(channels, dtype=np.float32)
                 for c in range(channels):
-                    pixel[c] = img[y, x, c] + error_buffer[x + 2, c]
+                    pixel[c] = min(max(img[y, x, c] + error_buffer[x + 2, c], 0.0), 255.0)
                 
                 # Ultra-fast nearest color search with early termination
                 best_idx = 0
@@ -282,31 +421,38 @@ if NUMBA_AVAILABLE:
         return result
 
     @jit(nopython=True, cache=True, fastmath=True)
-    def bayer_dither_turbo(image, bayer_matrix):
-        """Ultra-fast Bayer dithering for superior patterns"""
-        height, width = image.shape[:2]
+    def bayer_dither_gray_turbo(image, bayer_matrix):
+        """Ultra-fast Bayer dithering for grayscale images"""
+        height, width = image.shape
         matrix_h, matrix_w = bayer_matrix.shape
-        
-        if len(image.shape) == 2:
-            # Grayscale
-            result = np.zeros((height, width), dtype=np.uint8)
-            for y in range(height):
-                for x in range(width):
-                    threshold = bayer_matrix[y % matrix_h, x % matrix_w]
-                    pixel = image[y, x] + threshold - 127.5
-                    result[y, x] = 255 if pixel > 127.5 else 0
-        else:
-            # Color
-            channels = image.shape[2]
-            result = np.zeros((height, width, channels), dtype=np.uint8)
-            for y in range(height):
-                for x in range(width):
-                    threshold = bayer_matrix[y % matrix_h, x % matrix_w]
-                    for c in range(channels):
-                        pixel = image[y, x, c] + threshold - 127.5
-                        result[y, x, c] = 255 if pixel > 127.5 else 0
-        
+        result = np.zeros((height, width), dtype=np.uint8)
+        for y in range(height):
+            for x in range(width):
+                threshold = bayer_matrix[y % matrix_h, x % matrix_w]
+                pixel = image[y, x] + threshold - 127.5
+                result[y, x] = 255 if pixel > 127.5 else 0
         return result
+
+    @jit(nopython=True, cache=True, fastmath=True)
+    def bayer_dither_color_turbo(image, bayer_matrix):
+        """Ultra-fast Bayer dithering for color images"""
+        height, width, channels = image.shape
+        matrix_h, matrix_w = bayer_matrix.shape
+        result = np.zeros((height, width, channels), dtype=np.uint8)
+        for y in range(height):
+            for x in range(width):
+                threshold = bayer_matrix[y % matrix_h, x % matrix_w]
+                for c in range(channels):
+                    pixel = image[y, x, c] + threshold - 127.5
+                    result[y, x, c] = 255 if pixel > 127.5 else 0
+        return result
+
+    def bayer_dither_turbo(image, bayer_matrix):
+        """Bayer dithering dispatcher - separate kernels since Numba types both branches"""
+        if len(image.shape) == 2:
+            return bayer_dither_gray_turbo(image, bayer_matrix)
+        else:
+            return bayer_dither_color_turbo(image, bayer_matrix)
 
     @jit(nopython=True, cache=True, fastmath=True)
     def rosette_dither_gray_turbo(image, pattern):
@@ -403,8 +549,157 @@ if NUMBA_AVAILABLE:
         else:
             return text_dither_color_turbo(image, text_masks)
 
+    @jit(nopython=True, cache=True, fastmath=True)
+    def hybrid_bayer_fs_numba(img, quantize_levels, threshold_map, strength, right_angle):
+        """Floyd-Steinberg with a Bayer-modulated threshold - ordered texture woven into error diffusion.
+        right_angle sends error only right and down, giving straight hatching instead of curvy worms."""
+        height, width = img.shape
+        result = np.zeros((height, width), dtype=np.uint8)
+        step = (quantize_levels[-1] - quantize_levels[0]) / max(1, len(quantize_levels) - 1)
+        error_buffer = np.zeros(width + 4, dtype=np.float32)
+
+        for y in range(height):
+            next_error = np.zeros(width + 4, dtype=np.float32)
+
+            for x in range(width):
+                original_value = img[y, x] + error_buffer[x + 2]
+
+                # Bias the quantization decision with the Bayer map, but diffuse the true error
+                probe = original_value + threshold_map[y, x] * strength * step
+                nearest_level = quantize_levels[0]
+                min_dist = abs(quantize_levels[0] - probe)
+                for i in range(1, len(quantize_levels)):
+                    dist = abs(quantize_levels[i] - probe)
+                    if dist < min_dist:
+                        min_dist = dist
+                        nearest_level = quantize_levels[i]
+
+                result[y, x] = nearest_level
+                error = original_value - nearest_level
+
+                if right_angle:
+                    error_buffer[x + 3] += error * 0.5     # Right
+                    next_error[x + 2] += error * 0.5       # Bottom
+                else:
+                    error_buffer[x + 3] += error * 0.4375  # Right
+                    next_error[x + 1] += error * 0.1875    # Bottom-left
+                    next_error[x + 2] += error * 0.3125    # Bottom
+                    next_error[x + 3] += error * 0.0625    # Bottom-right
+
+            error_buffer = next_error
+
+        return result
+
+    @jit(nopython=True, cache=True, fastmath=True)
+    def hybrid_bayer_fs_color_numba(img, palette, threshold_map, strength, step, right_angle):
+        """Color Floyd-Steinberg with a Bayer-modulated threshold"""
+        height, width, channels = img.shape
+        result = np.zeros((height, width, channels), dtype=np.uint8)
+        error_buffer = np.zeros((width + 4, channels), dtype=np.float32)
+
+        for y in range(height):
+            next_error = np.zeros((width + 4, channels), dtype=np.float32)
+
+            for x in range(width):
+                pixel = np.empty(channels, dtype=np.float32)
+                for c in range(channels):
+                    pixel[c] = min(max(img[y, x, c] + error_buffer[x + 2, c], 0.0), 255.0)
+
+                # Shift all channels together so the pattern reads as light/dark texture
+                offset = threshold_map[y, x] * strength * step
+                best_idx = 0
+                min_dist = np.float32(999999.0)
+                for i in range(palette.shape[0]):
+                    diff0 = palette[i, 0] - (pixel[0] + offset)
+                    diff1 = palette[i, 1] - (pixel[1] + offset)
+                    diff2 = palette[i, 2] - (pixel[2] + offset)
+                    dist = diff0*diff0 + diff1*diff1 + diff2*diff2
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_idx = i
+
+                for c in range(channels):
+                    result_color = palette[best_idx, c]
+                    result[y, x, c] = result_color
+                    error = pixel[c] - result_color
+                    if right_angle:
+                        error_buffer[x + 3, c] += error * 0.5
+                        next_error[x + 2, c] += error * 0.5
+                    else:
+                        error_buffer[x + 3, c] += error * 0.4375
+                        next_error[x + 1, c] += error * 0.1875
+                        next_error[x + 2, c] += error * 0.3125
+                        next_error[x + 3, c] += error * 0.0625
+
+            error_buffer = next_error
+
+        return result
+
 else:
     # Fallback implementations without Numba
+    def hybrid_bayer_fs_numba(img, quantize_levels, threshold_map, strength, right_angle):
+        """Pure Python hybrid Bayer + Floyd-Steinberg dithering (fallback)"""
+        height, width = img.shape
+        work = img.astype(np.float32).copy()
+        result = np.zeros((height, width), dtype=np.uint8)
+        step = (quantize_levels[-1] - quantize_levels[0]) / max(1, len(quantize_levels) - 1)
+
+        for y in range(height):
+            for x in range(width):
+                original_value = work[y, x]
+                probe = original_value + threshold_map[y, x] * strength * step
+                nearest_level = quantize_levels[np.argmin(np.abs(quantize_levels - probe))]
+                result[y, x] = nearest_level
+                error = original_value - nearest_level
+
+                if right_angle:
+                    if x + 1 < width:
+                        work[y, x + 1] += error * 0.5
+                    if y + 1 < height:
+                        work[y + 1, x] += error * 0.5
+                    continue
+                if x + 1 < width:
+                    work[y, x + 1] += error * (7 / 16.0)
+                if y + 1 < height and x - 1 >= 0:
+                    work[y + 1, x - 1] += error * (3 / 16.0)
+                if y + 1 < height:
+                    work[y + 1, x] += error * (5 / 16.0)
+                if y + 1 < height and x + 1 < width:
+                    work[y + 1, x + 1] += error * (1 / 16.0)
+
+        return result
+
+    def hybrid_bayer_fs_color_numba(img, palette, threshold_map, strength, step, right_angle):
+        """Pure Python hybrid Bayer + Floyd-Steinberg color dithering (fallback)"""
+        height, width, channels = img.shape
+        work = img.astype(np.float32).copy()
+        result = np.zeros((height, width, channels), dtype=np.uint8)
+
+        for y in range(height):
+            for x in range(width):
+                original_pixel = np.clip(work[y, x], 0, 255)
+                probe = original_pixel + threshold_map[y, x] * strength * step
+                nearest_color = palette[np.argmin(np.sum((palette - probe) ** 2, axis=1))]
+                result[y, x] = nearest_color
+                error = original_pixel - nearest_color
+
+                if right_angle:
+                    if x + 1 < width:
+                        work[y, x + 1] += error * 0.5
+                    if y + 1 < height:
+                        work[y + 1, x] += error * 0.5
+                    continue
+                if x + 1 < width:
+                    work[y, x + 1] += error * (7 / 16.0)
+                if y + 1 < height and x - 1 >= 0:
+                    work[y + 1, x - 1] += error * (3 / 16.0)
+                if y + 1 < height:
+                    work[y + 1, x] += error * (5 / 16.0)
+                if y + 1 < height and x + 1 < width:
+                    work[y + 1, x + 1] += error * (1 / 16.0)
+
+        return result
+
     def floyd_steinberg_numba(dithered: np.ndarray, quantize_levels: np.ndarray) -> np.ndarray:
         """Pure Python Floyd-Steinberg dithering (fallback)"""
         height, width = dithered.shape
@@ -581,6 +876,212 @@ else:
         return np.clip(dithered, 0, 255).astype(np.uint8)
 
 
+def block_pattern_dither(img, palette, rank, detail):
+    """Floyd-Steinberg at block level with Bayer-ordered fills - uniform, grid-aligned patterns.
+    Each NxN block picks a mix of palette colors matching its average (plus diffused error),
+    then places them in Bayer order so every block reads as a regular pattern.
+    detail > 0 lets brighter pixels claim brighter colors first, keeping edges sharp."""
+    height, width, channels = img.shape
+    n = rank.shape[0]
+    num_colors = palette.shape[0]
+    blocks_y = (height + n - 1) // n
+    blocks_x = (width + n - 1) // n
+    result = np.zeros((height, width, channels), dtype=np.uint8)
+    block_error = np.zeros((blocks_y + 1, blocks_x + 2, channels), dtype=np.float32)
+
+    # Luma weights (single channel images use the value directly)
+    weights = np.ones(channels, dtype=np.float32)
+    if channels == 3:
+        weights[0] = 0.299
+        weights[1] = 0.587
+        weights[2] = 0.114
+    palette_luma = np.zeros(num_colors, dtype=np.float32)
+    for k in range(num_colors):
+        for c in range(channels):
+            palette_luma[k] += palette[k, c] * weights[c]
+
+    target = np.zeros(channels, dtype=np.float32)
+    mix_sum = np.zeros(channels, dtype=np.float32)
+    picks = np.zeros(n * n, dtype=np.int64)
+    pick_luma = np.zeros(n * n, dtype=np.float32)
+    scores = np.zeros(n * n, dtype=np.float32)
+
+    for by in range(blocks_y):
+        for bx in range(blocks_x):
+            y0 = by * n
+            x0 = bx * n
+            y1 = min(y0 + n, height)
+            x1 = min(x0 + n, width)
+            block_w = x1 - x0
+            count = (y1 - y0) * block_w
+
+            # Block average plus error carried in from neighboring blocks
+            for c in range(channels):
+                target[c] = 0.0
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    for c in range(channels):
+                        target[c] += img[y, x, c]
+            mean_luma = 0.0
+            for c in range(channels):
+                target[c] /= count
+                mean_luma += target[c] * weights[c]
+                target[c] = min(max(target[c] + block_error[by, bx + 1, c], 0.0), 255.0)
+
+            # Greedily pick palette colors so their running mix tracks the target
+            for c in range(channels):
+                mix_sum[c] = 0.0
+            for i in range(count):
+                best_idx = 0
+                min_dist = np.float32(1e30)
+                for k in range(num_colors):
+                    dist = 0.0
+                    for c in range(channels):
+                        diff = (mix_sum[c] + palette[k, c]) / (i + 1) - target[c]
+                        dist += diff * diff
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_idx = k
+                picks[i] = best_idx
+                pick_luma[i] = -palette_luma[best_idx]  # Negated: brightest first after argsort
+                for c in range(channels):
+                    mix_sum[c] += palette[best_idx, c]
+
+            # Diffuse the block's leftover error to neighboring blocks (Floyd-Steinberg weights)
+            for c in range(channels):
+                error = target[c] - mix_sum[c] / count
+                block_error[by, bx + 2, c] += error * 0.4375
+                block_error[by + 1, bx, c] += error * 0.1875
+                block_error[by + 1, bx + 1, c] += error * 0.3125
+                block_error[by + 1, bx + 2, c] += error * 0.0625
+
+            # Bayer rank decides which pixels get the brightest picks, nudged by local detail
+            idx = 0
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    pixel_luma = 0.0
+                    for c in range(channels):
+                        pixel_luma += img[y, x, c] * weights[c]
+                    scores[idx] = rank[y - y0, x - x0] / (n * n) - detail * (pixel_luma - mean_luma) / 255.0
+                    idx += 1
+            pixel_order = np.argsort(scores[:count])
+            color_order = np.argsort(pick_luma[:count])
+            for j in range(count):
+                p = pixel_order[j]
+                k = picks[color_order[j]]
+                for c in range(channels):
+                    result[y0 + p // block_w, x0 + p % block_w, c] = np.uint8(palette[k, c])
+
+    return result
+
+
+if NUMBA_AVAILABLE:
+    block_pattern_dither = jit(nopython=True, cache=True, fastmath=True)(block_pattern_dither)
+
+
+def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palette=None):
+    """True pixel-art cel shading for the Grid style: every art pixel is one solid color.
+
+    The picture is shrunk to the art-pixel grid (one cell per block), banded into a small
+    palette built from its own colors (or the given palette), and dithered only between
+    whole art pixels as a checkerboard where the image has a gentle gradient - flat areas
+    stay solid. Stray single pixels in calm areas are cleaned up, then the grid is blown
+    back up with nearest-neighbor to the image size.
+    image is HxWxC float (C = 3 or 1); palette is an optional KxC array of fixed colors."""
+    try:
+        import cv2
+    except ImportError:
+        return np.clip(image, 0, 255).astype(np.uint8)
+
+    height, width, channels = image.shape
+    grid_w = (width + block - 1) // block
+    grid_h = (height + block - 1) // block
+    src = np.clip(image, 0, 255).astype(np.uint8)
+    if channels == 1:
+        src = np.ascontiguousarray(src[..., 0])  # cv2.resize drops a single channel anyway
+
+    # Edge-preserving smoothing (at ~4x grid resolution, for speed) keeps texture noise
+    # from turning into stray pixels, then an area-average shrink gives one color per cell
+    mid_w, mid_h = min(width, grid_w * 4), min(height, grid_h * 4)
+    smooth = cv2.resize(src, (mid_w, mid_h), interpolation=cv2.INTER_AREA)
+    for _ in range(2):
+        smooth = cv2.bilateralFilter(smooth, 7, 35, 7)
+    small = cv2.resize(smooth, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
+
+    # Work in Lab for color (lightness only for grayscale) so bands follow perceived color
+    if channels == 3:
+        cells = cv2.cvtColor(small, cv2.COLOR_RGB2LAB).astype(np.float32)
+    else:
+        cells = small.astype(np.float32)[..., None]
+    features = cells.reshape(-1, cells.shape[2])
+
+    if palette is not None:
+        fixed = np.clip(np.asarray(palette, dtype=np.float32), 0, 255)
+        if channels == 3:
+            colors = cv2.cvtColor(fixed.astype(np.uint8)[None], cv2.COLOR_RGB2LAB)[0].astype(np.float32)
+        else:
+            colors = fixed.reshape(-1, 1)
+    else:
+        # Palette from the picture's own colors (deterministic k-means seeded across lightness)
+        num_colors = max(2, min(num_colors, len(features)))
+        order = np.argsort(features[:, 0])
+        colors = features[order[np.linspace(0, len(order) - 1, num_colors).astype(int)]].copy()
+        for _ in range(15):
+            nearest = ((features[:, None, :] - colors[None]) ** 2).sum(axis=2).argmin(axis=1)
+            for k in range(num_colors):
+                members = features[nearest == k]
+                if len(members):
+                    colors[k] = members.mean(axis=0)
+
+    # Gate: dither only on gentle slopes - not in flat areas, not across hard edges
+    lightness = cv2.GaussianBlur(cells[..., 0], (0, 0), 1.0)
+    slope_y, slope_x = np.gradient(lightness)
+    slope = np.hypot(slope_x, slope_y)
+    gate = np.clip(slope / 6.0, 0.0, 1.0) * np.clip((30.0 - slope) / 15.0, 0.0, 1.0)
+
+    # Checkerboard between whole art pixels: nudge lightness by a 4x4 Bayer threshold,
+    # scaled by the typical spacing between palette colors
+    if len(colors) > 1:
+        spacing = np.sqrt(((colors[:, None] - colors[None]) ** 2).sum(axis=2))
+        np.fill_diagonal(spacing, np.inf)
+        step = float(np.median(spacing.min(axis=1)))
+    else:
+        step = 0.0
+    bayer = (np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
+                      dtype=np.float32) + 0.5) / 16 - 0.5
+    rows, cols = np.mgrid[0:grid_h, 0:grid_w]
+    probe = cells.copy()
+    probe[..., 0] += bayer[rows % 4, cols % 4] * step * shading_dither * 2.0 * gate
+    labels = ((probe.reshape(-1, 1, probe.shape[2]) - colors[None]) ** 2).sum(axis=2).argmin(axis=1)
+    labels = labels.reshape(grid_h, grid_w)
+
+    # Pixel-art cleanup: a lone pixel matching none of its 4 neighbors in a calm area
+    # is noise, so it takes the most common neighboring color
+    calm = (slope < 8.0) & (gate < 0.3)
+    for _ in range(2):
+        padded = np.pad(labels, 1, mode='edge')
+        neighbors = np.stack([padded[:-2, 1:-1], padded[2:, 1:-1], padded[1:-1, :-2], padded[1:-1, 2:]])
+        orphan = (neighbors != labels[None]).all(axis=0) & calm
+        if not orphan.any():
+            break
+        best = neighbors[0].copy()
+        best_count = np.zeros_like(labels)
+        for a in range(4):
+            count = (neighbors == neighbors[a][None]).sum(axis=0)
+            better = count > best_count
+            best[better] = neighbors[a][better]
+            best_count[better] = count[better]
+        labels = np.where(orphan, best, labels)
+
+    if channels == 3:
+        colors_out = cv2.cvtColor(np.clip(colors, 0, 255).astype(np.uint8)[None], cv2.COLOR_LAB2RGB)[0]
+    else:
+        colors_out = np.clip(colors, 0, 255).astype(np.uint8)
+    grid = colors_out[labels]  # (grid_h, grid_w, C)
+    result = np.repeat(np.repeat(grid, block, axis=0), block, axis=1)
+    return np.ascontiguousarray(result[:height, :width])
+
+
 class DitherWorker(QThread):
     """Worker thread for dithering"""
     progress = pyqtSignal(int)
@@ -589,18 +1090,28 @@ class DitherWorker(QThread):
     status = pyqtSignal(str)  # status updates
     
     def __init__(self, input_path, output_path, method, levels, upsample, downscale, 
-                 use_grayscale=False, color_mode="bw", custom_colors=None, text_pattern=""):
+                 use_grayscale=False, color_mode="bw", custom_colors=None, text_pattern="",
+                 restore_size=True, hybrid_strength=0.5, hybrid_cell=4, hybrid_style="grid",
+                 cel_shade=False, cel_colors=24, cel_outlines=False, cel_dither=0.35):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
         self.method = method
         self.levels = levels
         self.upsample = upsample
-        self.downscale = downscale
+        self.downscale = max(1, int(downscale))  # Pre-dither shrink factor (pixelation)
+        self.restore_size = restore_size  # Scale back to original size with nearest-neighbor
         self.use_grayscale = use_grayscale
         self.color_mode = color_mode  # "bw", "full_color", "custom"
         self.custom_colors = custom_colors or []
         self.text_pattern = text_pattern
+        self.hybrid_strength = hybrid_strength  # 0 = pure Floyd-Steinberg, 1 = strongly Bayer-patterned
+        self.hybrid_cell = max(1, int(hybrid_cell))  # Block size (grid) or Bayer cell size (hatched/woven)
+        self.hybrid_style = hybrid_style  # "grid", "hatched" or "woven"
+        self.cel_shade = cel_shade  # Flatten into color bands with outlines before dithering
+        self.cel_colors = cel_colors
+        self.cel_outlines = cel_outlines
+        self.cel_dither = cel_dither  # Grid style: checkerboard between color bands on gradients (0-1)
         
         # Initialize dithering matrices
         self.bayer_2x2 = np.array([
@@ -639,6 +1150,7 @@ class DitherWorker(QThread):
             # Load static image
             image = Image.open(self.input_path)
             original_size = image.size
+            image = self.downscale_image(image)
             self.process_static_image(image, original_size)
             
         except Exception as e:
@@ -752,15 +1264,9 @@ class DitherWorker(QThread):
             else:
                 dithered_image = dithered_array
 
-        # Downscale if needed
-        if self.downscale and self.upsample > 1:
-            dithered_image = dithered_image.resize(original_size, Image.NEAREST)
-            if isinstance(dithered_array, np.ndarray):
-                if len(dithered_array.shape) == 3:
-                    dithered_image = Image.fromarray(dithered_array, mode='RGB')
-                else:
-                    # Single channel, convert to grayscale
-                    dithered_image = Image.fromarray(dithered_array, mode='L')
+        # Scale pixelated result back to original size with hard pixel edges
+        if self.downscale > 1 and self.restore_size:
+            dithered_image = dithered_image.resize(original_size, Image.Resampling.NEAREST)
 
         # Save with maximum PNG compression for optimal file size
         if self.output_path.lower().endswith('.png'):
@@ -961,6 +1467,15 @@ class DitherWorker(QThread):
         # Return lazy-loaded image from disk
         return Image.open(output_file)
 
+    def downscale_image(self, image):
+        """Shrink image by the downscale factor before dithering (pixelation)"""
+        if self.downscale <= 1:
+            return image
+        width, height = image.size
+        new_size = (max(1, width // self.downscale), max(1, height // self.downscale))
+        # BOX averages each block of source pixels, giving clean pixel-art colors
+        return image.resize(new_size, Image.Resampling.BOX)
+
     def smart_resize(self, image, new_size):
         """Intelligently resize image based on scale factor"""
         scale_factor = new_size[0] / image.size[0]
@@ -977,6 +1492,7 @@ class DitherWorker(QThread):
     def process_frame(self, frame_data: Tuple) -> Tuple[Image.Image, int]:
         """Process a single frame (used for parallel processing)"""
         frame_idx, frame, duration = frame_data
+        frame = self.downscale_image(frame)
 
         # Check if frame will be too large for memory BEFORE upscaling
         width, height = frame.size
@@ -1048,9 +1564,9 @@ class DitherWorker(QThread):
 
             dithered_frame = Image.fromarray(dithered_array, mode='L')
 
-        # Downscale if needed
-        if self.downscale and self.upsample > 1:
-            dithered_frame = dithered_frame.resize(self.original_size, Image.NEAREST)
+        # Scale pixelated frame back to original size with hard pixel edges
+        if self.downscale > 1 and self.restore_size:
+            dithered_frame = dithered_frame.resize(self.original_size, Image.Resampling.NEAREST)
 
         # Apply grayscale palette if requested
         if self.use_grayscale:
@@ -1126,9 +1642,15 @@ class DitherWorker(QThread):
             
             self.status.emit(f"Processing video: {total_frames} frames @ {fps:.2f} FPS ({width}x{height})")
             
-            # Calculate output dimensions (upscaled if requested)
-            out_width = width * self.upsample if self.upsample > 1 else width
-            out_height = height * self.upsample if self.upsample > 1 else height
+            # Calculate dithering dimensions (downscaled, then upscaled if requested)
+            dither_width = max(1, width // self.downscale) * self.upsample
+            dither_height = max(1, height // self.downscale) * self.upsample
+
+            # Output dimensions: original size if restoring a pixelated video
+            if self.downscale > 1 and self.restore_size:
+                out_width, out_height = width, height
+            else:
+                out_width, out_height = dither_width, dither_height
 
             # Setup video writer - always output as MP4
             output_path = str(Path(self.output_path).with_suffix('.mp4'))
@@ -1152,10 +1674,13 @@ class DitherWorker(QThread):
                 if not ret:
                     break
 
-                # Convert BGR to RGB and upscale if requested
+                # Convert BGR to RGB, then downscale and/or upscale if requested
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                if self.downscale > 1:
+                    frame_rgb = cv2.resize(frame_rgb, (max(1, width // self.downscale), max(1, height // self.downscale)),
+                                           interpolation=cv2.INTER_AREA)
                 if self.upsample > 1:
-                    pil_frame = self.smart_resize(Image.fromarray(frame_rgb), (out_width, out_height))
+                    pil_frame = self.smart_resize(Image.fromarray(frame_rgb), (dither_width, dither_height))
                     frame_rgb = np.array(pil_frame)
                 frame_batch.append(frame_rgb)
                 
@@ -1166,6 +1691,10 @@ class DitherWorker(QThread):
                     
                     # Write processed frames
                     for dithered_frame in dithered_batch:
+                        # Scale pixelated frame back up with hard pixel edges
+                        if (dithered_frame.shape[1], dithered_frame.shape[0]) != (out_width, out_height):
+                            dithered_frame = cv2.resize(dithered_frame, (out_width, out_height),
+                                                        interpolation=cv2.INTER_NEAREST)
                         # Convert RGB back to BGR for OpenCV
                         frame_bgr = cv2.cvtColor(dithered_frame, cv2.COLOR_RGB2BGR)
                         out.write(frame_bgr)
@@ -1224,6 +1753,11 @@ class DitherWorker(QThread):
         else:
             img_array = image.astype(np.float32) if image.dtype != np.float32 else image
 
+        # Grid style cel-shades its blocks after dithering (see _apply_hybrid_grid);
+        # other methods have no block structure, so they cel-shade the image beforehand
+        if self.cel_shade and not (method == "hybrid bayer + floyd-steinberg" and self.hybrid_style == "grid"):
+            img_array = self._apply_cel_shading(img_array)
+
         # Handle different color modes with optimized paths
         if self.color_mode == "bw":
             return self._apply_grayscale_dithering_turbo(img_array, method, levels)
@@ -1233,6 +1767,70 @@ class DitherWorker(QThread):
             return self._apply_custom_color_dithering_turbo(img_array, method)
         else:
             return self._apply_grayscale_dithering_turbo(img_array, method, levels)
+
+    def _apply_cel_shading(self, img_array):
+        """Run the cel-shading pre-pass for methods without a block grid"""
+        if len(img_array.shape) == 2:
+            img_array = np.stack([img_array] * 3, axis=-1)
+        rgb = np.clip(img_array[:, :, :3], 0, 255).astype(np.uint8)
+        outline_px = 0
+        if self.cel_outlines:
+            outline_px = max(1, round(min(rgb.shape[:2]) / 150))
+        return cel_shade_image(rgb, self.cel_colors, outline_px).astype(np.float32)
+
+    def _hybrid_threshold_map(self, height, width):
+        """Tile a Bayer matrix, scaled up to the weave cell size, as threshold offsets in [-0.5, 0.5]"""
+        matrix = np.array([
+            [0, 8, 2, 10],
+            [12, 4, 14, 6],
+            [3, 11, 1, 9],
+            [15, 7, 13, 5]
+        ], dtype=np.float32)
+        matrix = (matrix + 0.5) / 16 - 0.5
+        if self.hybrid_cell > 1:
+            matrix = np.kron(matrix, np.ones((self.hybrid_cell, self.hybrid_cell), dtype=np.float32))
+        reps_y = height // matrix.shape[0] + 1
+        reps_x = width // matrix.shape[1] + 1
+        return np.ascontiguousarray(np.tile(matrix, (reps_y, reps_x))[:height, :width])
+
+    def _bayer_rank(self, size):
+        """Bayer index matrix of the given size (cropped from the next power of two)"""
+        matrix = np.zeros((1, 1), dtype=np.float32)
+        while matrix.shape[0] < size:
+            matrix = np.block([[4 * matrix, 4 * matrix + 2], [4 * matrix + 3, 4 * matrix + 1]])
+        return np.ascontiguousarray(matrix[:size, :size], dtype=np.float32)
+
+    def _apply_hybrid_grid(self, img_array, palette):
+        """Grid-style hybrid: block-level error diffusion filled in Bayer order (HxWxC image, KxC palette)"""
+        # Full strength = strict Bayer fill; lower strength lets pixels follow image edges
+        if self.cel_shade:
+            # Cel-shaded pixel art: one solid color per block (art pixel) instead of a dither
+            # pattern; custom palettes are used as-is, otherwise the palette comes from the image
+            fixed_palette = palette if self.color_mode == "custom" else None
+            return pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors,
+                                       self.cel_dither, fixed_palette)
+        detail = (1.0 - self.hybrid_strength) * 3.0
+        return block_pattern_dither(np.ascontiguousarray(img_array, dtype=np.float32),
+                                    np.ascontiguousarray(palette, dtype=np.float32),
+                                    self._bayer_rank(self.hybrid_cell), np.float32(detail))
+
+    def _apply_hybrid_color(self, img_array, palette):
+        """Hybrid Bayer + Floyd-Steinberg against an RGB palette"""
+        if self.hybrid_style == "grid":
+            return self._apply_hybrid_grid(img_array, palette)
+        height, width = img_array.shape[:2]
+        palette = np.ascontiguousarray(palette, dtype=np.float32)
+        # Typical spacing between palette colors sets how far the Bayer offset can push a pixel
+        if len(palette) > 1:
+            distances = np.sqrt(((palette[:, None, :] - palette[None, :, :]) ** 2).sum(axis=2))
+            np.fill_diagonal(distances, np.inf)
+            step = float(np.median(distances.min(axis=1)) / np.sqrt(3))
+        else:
+            step = 255.0
+        return hybrid_bayer_fs_color_numba(np.ascontiguousarray(img_array), palette,
+                                           self._hybrid_threshold_map(height, width),
+                                           np.float32(self.hybrid_strength), np.float32(step),
+                                           self.hybrid_style == "hatched")
 
     def _apply_grayscale_dithering_turbo(self, img_array, method, levels):
         """TURBO grayscale dithering with extreme optimizations"""
@@ -1256,6 +1854,14 @@ class DitherWorker(QThread):
             result = floyd_steinberg_numba(img_gray, quantize_levels)
         elif method == "jarvis-judice-ninke":
             result = jarvis_judice_ninke_numba(img_gray, quantize_levels)
+        elif method == "hybrid bayer + floyd-steinberg" and self.hybrid_style == "grid":
+            result = self._apply_hybrid_grid(img_gray[:, :, None], quantize_levels[:, None])[:, :, 0]
+        elif method == "hybrid bayer + floyd-steinberg":
+            height, width = img_gray.shape
+            result = hybrid_bayer_fs_numba(np.ascontiguousarray(img_gray), quantize_levels,
+                                           self._hybrid_threshold_map(height, width),
+                                           np.float32(self.hybrid_strength),
+                                           self.hybrid_style == "hatched")
         elif method == "ordered dither":
             # Use 4x4 ordered dither matrix
             matrix = np.array([
@@ -1494,6 +2100,8 @@ class DitherWorker(QThread):
             result = floyd_steinberg_color_numba(img_array, palette)
         elif method == "jarvis-judice-ninke":
             result = floyd_steinberg_color_numba(img_array, palette)  # Use floyd-steinberg for now
+        elif method == "hybrid bayer + floyd-steinberg":
+            result = self._apply_hybrid_color(img_array, palette)
         elif method == "ordered dither":
             # Use 4x4 ordered dither matrix for color
             matrix = np.array([
@@ -1548,6 +2156,8 @@ class DitherWorker(QThread):
             result = floyd_steinberg_color_numba(img_array, palette)
         elif method == "jarvis-judice-ninke":
             result = floyd_steinberg_color_numba(img_array, palette)  # Use floyd-steinberg for now
+        elif method == "hybrid bayer + floyd-steinberg":
+            result = self._apply_hybrid_color(img_array, palette)
         elif method == "ordered dither":
             # Use 4x4 ordered dither matrix
             matrix = np.array([
@@ -1682,6 +2292,27 @@ class DitherApp(QMainWindow):
                                       stop:0 #3b82f6, stop:1 #0ea5e9);
             border-radius: 3px;
         }
+        QScrollArea {
+            border: none;
+        }
+        QScrollBar:vertical {
+            background: #0f1419;
+            width: 10px;
+            margin: 0;
+        }
+        QScrollBar::handle:vertical {
+            background: #1e293b;
+            border-radius: 5px;
+            min-height: 30px;
+        }
+        QScrollBar::handle:vertical:hover {
+            background: #334155;
+        }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical,
+        QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
+            height: 0;
+            background: none;
+        }
         QMessageBox {
             background-color: #0f1419;
         }
@@ -1717,10 +2348,15 @@ class DitherApp(QMainWindow):
         main_layout.setSpacing(16)
         central_widget.setLayout(main_layout)
 
-        # Left panel - Controls with better spacing
-        left_layout = QVBoxLayout()
+        # Left panel - scrollable settings above, pinned progress/process controls below
+        left_panel = QVBoxLayout()
+        left_panel.setSpacing(12)
+        left_panel.setContentsMargins(0, 0, 0, 0)
+
+        settings_widget = QWidget()
+        left_layout = QVBoxLayout(settings_widget)
         left_layout.setSpacing(12)
-        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setContentsMargins(0, 0, 12, 0)  # Right margin leaves room for the scrollbar
         
         # Image selection
         image_group = QGroupBox("Image")
@@ -1732,6 +2368,25 @@ class DitherApp(QMainWindow):
         self.select_btn = QPushButton("Select Image or Video")
         self.select_btn.clicked.connect(self.select_image)
         image_layout.addWidget(self.select_btn)
+
+        self.pixel_art_check = QCheckBox("Pixel Art Mode (auto-adjust settings for each image)")
+        self.pixel_art_check.toggled.connect(self.on_pixel_art_toggled)
+        image_layout.addWidget(self.pixel_art_check)
+
+        pixel_grid_layout = QHBoxLayout()
+        self.pixel_grid_label = QLabel("Art Pixels Across Short Side (auto from detail, lower = chunkier):")
+        self.pixel_grid_label.setWordWrap(True)
+        pixel_grid_layout.addWidget(self.pixel_grid_label)
+        self.pixel_grid_spin = QSpinBox()
+        self.pixel_grid_spin.setRange(32, 512)
+        self.pixel_grid_spin.setSingleStep(10)
+        self.pixel_grid_spin.setValue(140)
+        self.pixel_grid_spin.setMinimumWidth(90)
+        self.pixel_grid_spin.valueChanged.connect(self.on_pixel_grid_changed)
+        pixel_grid_layout.addWidget(self.pixel_grid_spin)
+        image_layout.addLayout(pixel_grid_layout)
+        self.pixel_grid_label.setEnabled(False)
+        self.pixel_grid_spin.setEnabled(False)
         image_group.setLayout(image_layout)
         left_layout.addWidget(image_group)
         
@@ -1742,6 +2397,7 @@ class DitherApp(QMainWindow):
         self.method_combo.addItems([
             "floyd-steinberg", 
             "jarvis-judice-ninke",
+            "hybrid bayer + floyd-steinberg",
             "ordered dither",
             "bayer 2x2",
             "bayer 4x4", 
@@ -1763,9 +2419,77 @@ class DitherApp(QMainWindow):
         self.text_pattern_widget.setLayout(text_pattern_layout)
         self.text_pattern_widget.hide()
         method_layout.addWidget(self.text_pattern_widget)
+
+        # Hybrid Bayer + Floyd-Steinberg controls (hidden by default)
+        self.hybrid_widget = QWidget()
+        hybrid_layout = QVBoxLayout()
+        hybrid_layout.setContentsMargins(0, 0, 0, 0)
+        hybrid_layout.addWidget(QLabel("Style:"))
+        self.hybrid_style_combo = QComboBox()
+        self.hybrid_style_combo.addItems([
+            "Grid (uniform blocks)",
+            "Hatched (right-angle diffusion)",
+            "Woven (Bayer-modulated)"
+        ])
+        self.hybrid_style_combo.currentIndexChanged.connect(self.update_hybrid_labels)
+        hybrid_layout.addWidget(self.hybrid_style_combo)
+        self.hybrid_strength_label = QLabel()
+        self.hybrid_strength_label.setWordWrap(True)
+        hybrid_layout.addWidget(self.hybrid_strength_label)
+        self.hybrid_strength_spin = QSpinBox()
+        self.hybrid_strength_spin.setRange(0, 100)
+        self.hybrid_strength_spin.setSuffix("%")
+        self.hybrid_strength_spin.setValue(50)
+        hybrid_layout.addWidget(self.hybrid_strength_spin)
+        self.hybrid_cell_label = QLabel()
+        hybrid_layout.addWidget(self.hybrid_cell_label)
+        self.hybrid_cell_spin = QSpinBox()
+        self.hybrid_cell_spin.setRange(1, 64)
+        self.hybrid_cell_spin.setSuffix(" px")
+        self.hybrid_cell_spin.setValue(4)
+        hybrid_layout.addWidget(self.hybrid_cell_spin)
+        self.update_hybrid_labels()
+        self.hybrid_widget.setLayout(hybrid_layout)
+        self.hybrid_widget.hide()
+        method_layout.addWidget(self.hybrid_widget)
         
         method_group.setLayout(method_layout)
         left_layout.addWidget(method_group)
+
+        # Cel shading pre-pass
+        cel_group = QGroupBox("Cel Shading")
+        cel_layout = QVBoxLayout()
+        self.cel_check = QCheckBox("Cel-shade (flat color bands, pixel-art outlines)")
+        self.cel_check.toggled.connect(self.update_cel_controls)
+        cel_layout.addWidget(self.cel_check)
+        cel_colors_layout = QHBoxLayout()
+        self.cel_colors_label = QLabel("Color Bands:")
+        cel_colors_layout.addWidget(self.cel_colors_label)
+        self.cel_colors_spin = QSpinBox()
+        self.cel_colors_spin.setRange(4, 64)
+        self.cel_colors_spin.setValue(24)
+        self.cel_colors_spin.setMinimumWidth(80)
+        cel_colors_layout.addWidget(self.cel_colors_spin)
+        cel_layout.addLayout(cel_colors_layout)
+        self.cel_outlines_check = QCheckBox("Dark outlines (strong silhouettes only)")
+        self.cel_outlines_check.setChecked(False)
+        cel_layout.addWidget(self.cel_outlines_check)
+        cel_dither_layout = QHBoxLayout()
+        self.cel_dither_label = QLabel("Shading Dither (checkerboard between bands, 0% = flat):")
+        self.cel_dither_label.setWordWrap(True)
+        cel_dither_layout.addWidget(self.cel_dither_label)
+        self.cel_dither_spin = QSpinBox()
+        self.cel_dither_spin.setRange(0, 100)
+        self.cel_dither_spin.setSuffix("%")
+        self.cel_dither_spin.setValue(35)
+        self.cel_dither_spin.setMinimumWidth(80)
+        cel_dither_layout.addWidget(self.cel_dither_spin)
+        cel_layout.addLayout(cel_dither_layout)
+        cel_group.setLayout(cel_layout)
+        left_layout.addWidget(cel_group)
+        self.method_combo.currentTextChanged.connect(self.update_cel_controls)
+        self.hybrid_style_combo.currentIndexChanged.connect(self.update_cel_controls)
+        self.update_cel_controls()
 
         # Color Mode selection
         color_mode_group = QGroupBox("Color Mode")
@@ -1840,6 +2564,26 @@ class DitherApp(QMainWindow):
 
         upsample_group.setLayout(upsample_layout)
         left_layout.addWidget(upsample_group)
+
+        # Downscaling (pixelation)
+        downscale_group = QGroupBox("Downscale (Pixelate)")
+        downscale_layout = QVBoxLayout()
+        self.downscale_spin = QSpinBox()
+        self.downscale_spin.setMinimum(1)
+        self.downscale_spin.setMaximum(64)
+        self.downscale_spin.setValue(1)
+        self.downscale_spin.setMinimumWidth(80)
+        self.downscale_label = QLabel("Downscale Factor: 1x (No downscaling)")
+        self.restore_size_check = QCheckBox("Scale back to original size (chunky pixels)")
+        self.restore_size_check.setChecked(True)
+        downscale_layout.addWidget(self.downscale_label)
+        downscale_layout.addWidget(self.downscale_spin)
+        downscale_layout.addWidget(self.restore_size_check)
+        self.downscale_spin.valueChanged.connect(self.update_downscale_label)
+        self.restore_size_check.toggled.connect(self.update_dimensions_text)
+
+        downscale_group.setLayout(downscale_layout)
+        left_layout.addWidget(downscale_group)
         
         # Output directory
         output_group = QGroupBox("Output")
@@ -1849,6 +2593,13 @@ class DitherApp(QMainWindow):
         output_layout.addWidget(self.output_label)
         output_group.setLayout(output_layout)
         left_layout.addWidget(output_group)
+        left_layout.addStretch()
+
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        settings_scroll.setWidget(settings_widget)
+        left_panel.addWidget(settings_scroll, 1)
         
         # Progress with label for percentage
         progress_container = QWidget()
@@ -1868,7 +2619,7 @@ class DitherApp(QMainWindow):
 
         progress_layout.addWidget(self.progress_bar)
         progress_layout.addWidget(self.progress_label)
-        left_layout.addWidget(progress_container)
+        left_panel.addWidget(progress_container)
         
         # Process button - large and prominent
         self.process_btn = QPushButton("▶ Process Image")
@@ -1876,18 +2627,17 @@ class DitherApp(QMainWindow):
         self.process_btn.setEnabled(False)
         self.process_btn.setMinimumHeight(60)
         self.process_btn.setFont(self.get_large_font())
-        left_layout.addWidget(self.process_btn)
+        left_panel.addWidget(self.process_btn)
         
         # Status
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
-        left_layout.addWidget(self.status_label)
+        left_panel.addWidget(self.status_label)
         
         # Custom colors storage
         self.custom_colors = []
         
-        left_layout.addStretch()
-        main_layout.addLayout(left_layout, 1)
+        main_layout.addLayout(left_panel, 1)
         
         # Right panel - Previews with better styling
         right_layout = QVBoxLayout()
@@ -2059,24 +2809,13 @@ class DitherApp(QMainWindow):
                         self.process_btn.setEnabled(False)
                 else:
                     # Handle image file
-                    image = Image.open(file_path)
-                    width, height = image.size
-                    
-                    # Get current upsample factor
-                    upsample = self.upsample_spin.value()
-                    
-                    # Calculate projected dimensions
-                    if upsample > 1:
-                        projected_width = width * upsample
-                        projected_height = height * upsample
-                        dims_text = f"Selected: {Path(file_path).name}\nOriginal: {width}x{height} px\nProjected (with {upsample}x upsampling): {projected_width}x{projected_height} px"
-                    else:
-                        dims_text = f"Selected: {Path(file_path).name}\nDimensions: {width}x{height} px"
-                    
-                    self.image_label.setText(dims_text)
+                    self.update_dimensions_text()
                     self.process_btn.setEnabled(True)
                     self.status_label.setText("Image loaded. Ready to process.")
                     self.show_before_preview(file_path)
+
+                if self.current_image_path and self.pixel_art_check.isChecked():
+                    self.apply_pixel_art_settings()
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Could not load file: {str(e)}")
                 self.current_image_path = None
@@ -2119,11 +2858,103 @@ class DitherApp(QMainWindow):
             self.before_preview.setText(f"Error loading preview: {str(e)}")
     
     def on_method_changed(self, method_text):
-        """Show/hide text pattern input based on method selection"""
+        """Show/hide method-specific controls based on method selection"""
         if method_text == "text pattern":
             self.text_pattern_widget.show()
         else:
             self.text_pattern_widget.hide()
+        self.hybrid_widget.setVisible(method_text == "hybrid bayer + floyd-steinberg")
+
+    def on_pixel_art_toggled(self, *_):
+        """Apply pixel art settings right away if an image is already loaded"""
+        checked = self.pixel_art_check.isChecked()
+        self.pixel_grid_label.setEnabled(checked)
+        self.pixel_grid_spin.setEnabled(checked)
+        if checked and self.current_image_path:
+            self.apply_pixel_art_settings()
+
+    def on_pixel_grid_changed(self, *_):
+        """Re-apply pixel art settings with the hand-picked grid size"""
+        if self.pixel_art_check.isChecked() and self.current_image_path:
+            self.apply_pixel_art_settings(auto_grid=False)
+
+    def apply_pixel_art_settings(self, auto_grid=True):
+        """Analyze the loaded image or video and set the hybrid grid controls for pixel art.
+        auto_grid picks the art-pixel grid from image detail; otherwise the grid control's value is used."""
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
+        try:
+            if self.current_image_path.lower().endswith(video_extensions):
+                import cv2
+                cap = cv2.VideoCapture(self.current_image_path)
+                width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                # Sample a frame from the middle of the video
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) // 2)
+                ret, frame = cap.read()
+                cap.release()
+                if not ret:
+                    raise Exception("Could not read a frame from the video")
+                thumbnail = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            else:
+                thumbnail = Image.open(self.current_image_path).convert('RGB')
+                width, height = thumbnail.size
+            # Analyze at up to 512 px on the short side - enough to judge detail at 220 art pixels
+            scale = min(1.0, 512 / min(thumbnail.size))
+            if scale < 1.0:
+                thumbnail = thumbnail.resize((max(1, round(thumbnail.width * scale)),
+                                              max(1, round(thumbnail.height * scale))), Image.Resampling.BOX)
+            thumbnail_array = np.array(thumbnail)
+            detail_note = ""
+            if auto_grid:
+                cells, retained = estimate_pixel_art_cells(thumbnail_array)
+                self.pixel_grid_spin.blockSignals(True)
+                self.pixel_grid_spin.setValue(cells)
+                self.pixel_grid_spin.blockSignals(False)
+                detail_note = f"detail analysis picked {cells} (keeps {retained:.0%} of detail), "
+            settings = suggest_pixel_art_settings(thumbnail_array, width, height,
+                                                  self.pixel_grid_spin.value())
+        except Exception as e:
+            self.status_label.setText(f"Pixel Art Mode: could not analyze file ({e})")
+            return
+
+        self.method_combo.setCurrentText("hybrid bayer + floyd-steinberg")
+        self.hybrid_style_combo.setCurrentIndex(0)  # Grid
+        self.hybrid_strength_spin.setValue(settings["strength"])
+        self.hybrid_cell_spin.setValue(settings["block_size"])
+        self.color_mode_combo.setCurrentText(settings["color_mode"])
+        self.levels_spin.setValue(settings["levels"])
+        self.upsample_spin.setValue(settings["upsample"])
+        self.downscale_spin.setValue(1)
+
+        palette = "8-color palette" if settings["color_mode"] == "Full Color Spectrum" else "4 gray levels"
+        grid_w, grid_h = settings["grid"]
+        self.status_label.setText(f"Pixel Art Mode: {detail_note}{grid_w}x{grid_h} pixel grid, {palette}. "
+                                  f"Tweak any setting before processing.")
+
+    def update_cel_controls(self, *_):
+        """Enable the cel shading options only when the pass is on"""
+        enabled = self.cel_check.isChecked()
+        self.cel_colors_label.setEnabled(enabled)
+        self.cel_colors_spin.setEnabled(enabled)
+        # Grid style renders solid-color pixel art: shading dither applies, outlines don't
+        grid = (self.method_combo.currentText() == "hybrid bayer + floyd-steinberg"
+                and self.get_hybrid_style() == "grid")
+        self.cel_outlines_check.setEnabled(enabled and not grid)
+        self.cel_dither_label.setEnabled(enabled and grid)
+        self.cel_dither_spin.setEnabled(enabled and grid)
+
+    def get_hybrid_style(self):
+        """Internal name of the selected hybrid style"""
+        return ("grid", "hatched", "woven")[self.hybrid_style_combo.currentIndex()]
+
+    def update_hybrid_labels(self):
+        """Describe the strength and cell controls for the selected hybrid style"""
+        if self.get_hybrid_style() == "grid":
+            self.hybrid_strength_label.setText("Pattern Strength (100% = strict grid, lower follows edges):")
+            self.hybrid_cell_label.setText("Block Size:")
+        else:
+            self.hybrid_strength_label.setText("Bayer Strength (0% = pure error diffusion):")
+            self.hybrid_cell_label.setText("Bayer Cell Size (1 = finest):")
     
     def update_levels_label(self):
         """Update the levels label"""
@@ -2142,23 +2973,45 @@ class DitherApp(QMainWindow):
         else:
             text = f"Upscale Factor: {value}x"
         self.upsample_label.setText(text)
-        
-        # Update image dimensions if an image is loaded
-        if self.current_image_path:
-            try:
-                image = Image.open(self.current_image_path)
-                width, height = image.size
-                
-                if value > 1:
-                    projected_width = width * value
-                    projected_height = height * value
-                    dims_text = f"Selected: {Path(self.current_image_path).name}\nOriginal: {width}x{height} px\nProjected (with {value}x upsampling): {projected_width}x{projected_height} px"
-                else:
-                    dims_text = f"Selected: {Path(self.current_image_path).name}\nDimensions: {width}x{height} px"
-                
-                self.image_label.setText(dims_text)
-            except:
-                pass
+        self.update_dimensions_text()
+
+    def update_downscale_label(self):
+        """Update the downscale label"""
+        value = self.downscale_spin.value()
+        if value == 1:
+            text = "Downscale Factor: 1x (No downscaling)"
+        else:
+            text = f"Downscale Factor: {value}x (dithers at 1/{value} size)"
+        self.downscale_label.setText(text)
+        self.update_dimensions_text()
+
+    def update_dimensions_text(self):
+        """Show original and projected output dimensions for the loaded image"""
+        if not self.current_image_path:
+            return
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
+        if self.current_image_path.lower().endswith(video_extensions):
+            return
+        try:
+            image = Image.open(self.current_image_path)
+            width, height = image.size
+        except:
+            return
+
+        upsample = self.upsample_spin.value()
+        downscale = self.downscale_spin.value()
+        name = Path(self.current_image_path).name
+
+        if upsample == 1 and downscale == 1:
+            self.image_label.setText(f"Selected: {name}\nDimensions: {width}x{height} px")
+            return
+
+        dither_width = max(1, width // downscale) * upsample
+        dither_height = max(1, height // downscale) * upsample
+        dims_text = f"Selected: {name}\nOriginal: {width}x{height} px\nDithered at: {dither_width}x{dither_height} px"
+        if downscale > 1 and self.restore_size_check.isChecked():
+            dims_text += f"\nOutput: {width}x{height} px"
+        self.image_label.setText(dims_text)
     
     def get_unique_output_path(self, base_path):
         """Generate unique output path by appending suffix if needed"""
@@ -2212,6 +3065,8 @@ class DitherApp(QMainWindow):
             method = "floyd-steinberg"
         elif method_text == "jarvis-judice-ninke":
             method = "jarvis-judice-ninke"
+        elif method_text == "hybrid bayer + floyd-steinberg":
+            method = "hybrid bayer + floyd-steinberg"
         elif method_text == "ordered dither":
             method = "ordered dither"
         elif method_text == "bayer 2x2":
@@ -2229,7 +3084,8 @@ class DitherApp(QMainWindow):
             
         levels = self.levels_spin.value()
         upsample = self.upsample_spin.value()
-        downscale = False
+        downscale = self.downscale_spin.value()
+        restore_size = self.restore_size_check.isChecked()
         use_grayscale = False
         
         # Determine color mode
@@ -2265,7 +3121,15 @@ class DitherApp(QMainWindow):
             use_grayscale,
             color_mode,
             custom_colors,
-            text_pattern
+            text_pattern,
+            restore_size,
+            self.hybrid_strength_spin.value() / 100.0,
+            self.hybrid_cell_spin.value(),
+            self.get_hybrid_style(),
+            self.cel_check.isChecked(),
+            self.cel_colors_spin.value(),
+            self.cel_outlines_check.isChecked(),
+            self.cel_dither_spin.value() / 100.0
         )
         self.worker_thread.progress.connect(self.update_progress)
         self.worker_thread.finished.connect(self.on_finished)
