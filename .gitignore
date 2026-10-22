@@ -1,1 +1,11 @@
 .venv/
+__pycache__/
+
+# Local test material and outputs
+/dithered/
+/test_depth_dither/
+/Pasted image*.png
+/Clock-Gears-Moving-SnapYT.App.mp4
+
+# Mark Ferrari reference scenes (copyrighted, analysis only - never commit)
+/ferrari/

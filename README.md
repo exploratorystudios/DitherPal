@@ -67,8 +67,8 @@ Same photo, **Pixel Art Mode + Cel Shading** — the only thing changed between 
 ## Features
 
 - **Multiple dithering algorithms** — Floyd-Steinberg, Jarvis-Judice-Ninke, Hybrid Bayer + Floyd-Steinberg, Bayer (2×2, 4×4, 8×8), Ordered, Rosette Pattern, Text Pattern
-- **Pixel Art Mode** — One checkbox analyzes your picture and sets everything up to turn it into pixel art
-- **Cel-shaded pixel art** — Solid-color art pixels, a palette built from your image's own colors, and checkerboard shading only where the image has gradients
+- **Pixel Art Mode** — Pick **High Res** or **Retro** and DitherPal analyzes your picture and sets everything up to turn it into pixel art
+- **Depth-mapped pixel-art dithering** — Solid-color cel-shaded art pixels plus a dither modeled on real pixel art: Mark Ferrari-style fine gradient dithering (High Res) or Gen 3 Pokémon sprite-style seams (Retro)
 - **Color modes** — Black & White, Full Color Spectrum, Custom palette
 - **Infinite upscaling** — Super-sample before dithering for ultra-sharp output at any resolution (and finer pixel art)
 - **Downscale (Pixelate)** — Dither at a fraction of the size, then scale back up with hard pixel edges
@@ -112,10 +112,16 @@ python ditherpal.py
 
 ## Pixel Art Mode
 
-1. Open an image and tick **Pixel Art Mode** (under *Select Image or Video*)
-2. Tick **Cel-shade** in the *Cel Shading* box for true pixel art — every art pixel becomes one solid color
-3. **Raise the Upscale Factor to 4× (or more)** — see below
-4. Click **Process**
+1. Open an image and pick a **Pixel Art Mode** (under *Select Image or Video*):
+   - **High Res** — detailed pixel art in the style of Mark Ferrari's *Living Worlds* scenes: fine dithering between close shades on smooth gradients and in the distance, crisp flat color up close
+   - **Retro** — Gen 3 (Ruby/Sapphire/Emerald) Pokémon sprite style: flat shade bands with thin checkered seams where neighboring shades meet, wider seams on nearby objects
+2. **Raise the Upscale Factor to 4× (or more)** — see below
+3. Click **Process**
+
+Both modes turn on **Cel Shading** automatically (it's required — every art pixel is one solid color). A depth map
+estimated from the picture decides where the dithering goes, and **Pattern Strength** sets how much (0% = flat cel shading).
+The dithering rules were measured from real pixel art: 11 *Living Worlds* scenes (about 22% of pixels dithered,
+always between close shades, densest far away) and 145 Emerald sprites (thin 1–2 px seams between neighboring shades only).
 
 > [!IMPORTANT]
 > ### 🔍 Play with the Upscale Factor — it's the secret to great pixel art
@@ -135,9 +141,9 @@ python ditherpal.py
 
 | Setting | What it picks |
 |---------|---------------|
-| Method | Hybrid Bayer + Floyd-Steinberg, Grid style, 85% pattern strength |
+| Method | Hybrid Bayer + Floyd-Steinberg, Grid style, 85% pattern strength (the pixel-art dither amount) |
 | Art pixel grid | Measured from your picture's detail: it samples the image in regions and picks the chunkiest grid that still keeps ~89% of the detail. Busy photos get finer grids, simple cartoons chunkier ones |
-| Colors | 8-color full-color palette for colorful images, 4 gray levels for grayscale/line art (with Cel Shading on, the palette is built from your image instead) |
+| Colors | Cel Shading on, with a palette built from your image's own colors (gray bands for grayscale/line art) |
 | Upscale | 2× to start — **raise it!** |
 
 All settings stay editable. **Art Pixels Across Short Side** lets you override the grid directly (lower = chunkier).
@@ -147,7 +153,7 @@ All settings stay editable. **Art Pixels Across Short Side** lets you override t
 | Control | What it does |
 |---------|--------------|
 | Color Bands | Size of the palette built from your image (default 24). More = more faithful colors, fewer = flatter, more stylized |
-| Shading Dither | Checkerboard shading between color bands on gradients (default 35%). 0% = perfectly flat bands |
+| Shading Dither | Without a Pixel Art Mode: checkerboard shading between color bands on gradients (default 35%). 0% = perfectly flat bands. Pixel Art Modes use their own dithering instead |
 
 With a **Custom palette** color mode, cel shading uses your colors instead of building a palette.
 
