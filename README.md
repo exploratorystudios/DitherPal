@@ -143,6 +143,24 @@ Mode the SVG is drawn as vector art pixels; for other methods it is a flipbook o
 >
 > **This is the only way to get the finer details**, and once you find the right factor for your picture it works
 > nearly perfectly. Try a few values — processing takes seconds.
+>
+> #### 🎚️ Dial in the exact look: Upscale and Block Size work as a sliding window
+>
+> The two settings pull in opposite directions:
+>
+> - **Upscale Factor ↑** → closer to the original picture (more realism and detail)
+> - **Block Size ↑** → chunkier, more pixel-art-like
+>
+> So you can slide between the two to land on exactly the pixel-art quality you want:
+>
+> 1. **Push the Upscale Factor up** until the details you care about (faces, text, edges) come through
+> 2. **Nudge Block Size up in small steps** until it looks like pixel art again — stop when it looks right
+> 3. Too blocky? Take Block Size back a step, or raise the upscale another notch and repeat
+>
+> What really matters is the ratio: an art pixel covers **Block Size ÷ Upscale** pixels of the original. 4× upscale with
+> block 16 makes the same size art pixels as 2× with block 8. The higher upscale gives you finer steps to adjust in
+> and a cleaner result. If you see the ⚠ warning at the top of the settings, pick a Block Size that's a multiple of
+> the Upscale Factor so every art pixel comes out the same size.
 
 **What Pixel Art Mode sets for you:**
 
