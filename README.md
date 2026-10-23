@@ -149,11 +149,65 @@ suggested from image detail and stays editable. **Pattern Strength** controls th
 amount of dithering; **Color Bands** controls the image-derived cel palette (4–64).
 Custom-palette modes preserve your chosen colors.
 
-Upscale and Block Size work together: an art pixel covers approximately
-**Block Size ÷ Upscale Factor** source pixels. Raising upscale while holding block
-size fixed creates finer art pixels. Increasing block size makes the result
-chunkier. With "Scale result back to original size", choose a block size divisible
-by the upscale factor for even-sized art pixels.
+> [!IMPORTANT]
+> ### 🔍 Play with the Upscale Factor — it's the secret to great pixel art
+>
+> Pixel Art Mode sets the *Block Size* (how big each art pixel is) for a **2×** upscale.
+> When you raise the **Upscale Factor** and leave the block size alone, every art
+> pixel covers **less of the original picture** — so you get **more, finer art
+> pixels** and the small details come back.
+>
+> - **2×** — chunky, bold pixel art; small details can get lost
+> - **4×** — a useful starting point for finer detail in photos
+> - **6×–8×** — even finer detail for busy pictures
+>
+> Try a few values to find the right factor for your picture. Higher upscale
+> factors also increase processing time and memory use.
+>
+> #### 🎚️ Dial in the exact look: Upscale and Block Size work as a sliding window
+>
+> The two settings pull in opposite directions:
+>
+> - **Upscale Factor ↑** → closer to the original picture, with more detail
+> - **Block Size ↑** → chunkier, more pixel-art-like
+>
+> To find the balance you want:
+>
+> 1. **Push the Upscale Factor up** until the details you care about (faces, text,
+>    edges) come through.
+> 2. **Nudge Block Size up in small steps** until it looks like pixel art again.
+> 3. Too blocky? Take Block Size back a step, or raise the upscale another notch
+>    and repeat.
+>
+> What matters is the ratio: an art pixel covers approximately **Block Size ÷
+> Upscale Factor** pixels of the original. **4× upscale with block 16** makes the
+> same size art pixels as **2× with block 8**. The higher upscale gives you finer
+> steps to adjust the ratio. With **Scale result back to original size**, choose
+> a Block Size that's a multiple of the Upscale Factor so every art pixel comes
+> out the same size; the ratio warning helps flag uneven combinations.
+
+**What Pixel Art Mode sets for you:**
+
+| Setting | What it picks |
+| --- | --- |
+| Method | Hybrid Bayer + Floyd–Steinberg, Grid style, 85% Pattern Strength |
+| Art pixel grid | Suggested from your picture's detail: busy photos get finer grids, simple cartoons chunkier ones |
+| Colors | Cel Shading on, with a palette built from your image's colors; custom-palette modes use your chosen colors |
+| Upscale | 2× to start — try raising it for finer detail |
+
+All settings stay editable. **Art Pixels Across Short Side** lets you override
+the grid directly; lower values make chunkier art pixels. **Pattern Strength**
+sets the amount of pixel-art dithering; 0% gives flat cel shading.
+
+**Cel Shading controls** (Grid style):
+
+| Control | What it does |
+| --- | --- |
+| Color Bands | Size of the image-derived palette (default 24). More bands preserve more colors; fewer give a flatter, more stylized result |
+| Shading Dither | Without a Pixel Art Mode, adds checkerboard shading between color bands on gradients (default 35%). 0% gives flat bands. High Res and Retro use their own dithering instead |
+
+With a **Custom palette** color mode, cel shading uses your colors instead of
+building a palette.
 
 Depth is inferred from source RGB before grayscale conversion or cel shading,
 then shared with the selected pixel-art style. Re-rendering the same unchanged
