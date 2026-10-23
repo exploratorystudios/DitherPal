@@ -1498,6 +1498,11 @@ class DitherWorker(QThread):
             [63, 31, 55, 23, 61, 29, 53, 21]
         ], dtype=np.float32) * (255 / 64)
     
+    @property
+    def thread_finished(self):
+        """Native thread exit, distinct from the result-ready finished signal."""
+        return QThread.finished.__get__(self)
+
     def run(self):
         try:
             self.progress.emit(0)
@@ -1538,6 +1543,10 @@ class DitherWorker(QThread):
             return
         except Exception as e:
             self.error.emit(f"Error during dithering: {str(e)}")
+        finally:
+            # The UI loads previews from disk; completed workers need no image buffers.
+            self.source_depth = self.preview_frame = None
+            self.locked_palette = self.locked_color_palette = None
     
     def process_static_image(self, image, original_size):
         """Process a single static image with efficient scaling and chunk processing"""
@@ -3976,8 +3985,16 @@ class DitherApp(QMainWindow):
         self.worker_thread.finished.connect(self.on_finished)
         self.worker_thread.error.connect(self.on_error)
         self.worker_thread.status.connect(self.update_status)
+        self.worker_thread.thread_finished.connect(self.on_worker_stopped)
         self.worker_thread.start()
     
+    def on_worker_stopped(self):
+        worker = self.sender()
+        if worker is self.worker_thread:
+            self.worker_thread = None
+            self.process_btn.setEnabled(True)
+        worker.deleteLater()
+
     def update_status(self, message):
         """Update status label with custom message"""
         self.status_label.setText(message)
@@ -4003,8 +4020,6 @@ class DitherApp(QMainWindow):
         """Handle dithering completion"""
         if self.closing_app:
             return
-        self.process_btn.setEnabled(True)
-
         # Get output dimensions
         try:
             with Image.open(output_path) as output_image:
@@ -4309,7 +4324,6 @@ class DitherApp(QMainWindow):
 
     def on_error(self, error_message):
         """Handle dithering error"""
-        self.process_btn.setEnabled(True)
         self.status_label.setText("Error occurred")
         self.progress_bar.setValue(0)
         self.progress_label.setText("✗ Error")

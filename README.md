@@ -154,6 +154,10 @@ The first depth-aware operation downloads **Depth Anything V2 Small** (about
 99 MB) into `models/`. The download is pinned and SHA-256 verified. Images are
 processed locally. Later runs reuse the weights, an in-process ONNX session, and
 cached source-image maps. Models and generated output are excluded from Git.
+The source cache holds at most four small previews. Neural inference releases its
+temporary activation buffers between jobs instead of retaining peak allocations
+for every image shape. Completed render workers release their image buffers;
+the model session stays loaded to avoid reloading weights for each render.
 There is one Python environment; the app does not depend on an experimental folder.
 
 To download the model ahead of time:

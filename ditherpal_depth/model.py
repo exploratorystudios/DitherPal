@@ -95,6 +95,10 @@ def infer_depth(rgb, model_path=DEFAULT_MODEL, threads=4, progress=None):
             options = ort.SessionOptions()
             options.intra_op_num_threads = threads
             options.inter_op_num_threads = 1
+            # Aspect ratios change the DPT tensor shape. Retaining arena blocks and
+            # shape-specific memory plans keeps old activation peaks resident while idle.
+            options.enable_cpu_mem_arena = False
+            options.enable_mem_pattern = False
             _sessions[key] = ort.InferenceSession(str(path), options, providers=['CPUExecutionProvider'])
         session = _sessions[key]
         specification = session.get_inputs()[0]

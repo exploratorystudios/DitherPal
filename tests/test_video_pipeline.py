@@ -107,7 +107,7 @@ class VideoPipelineTest(unittest.TestCase):
                 self.assertEqual(pool.call_count, 1)
                 self.assertIsNone(worker.frame_executor)
                 self.assertFalse(worker.lock_palette)
-                self.assertIsNotNone(worker.preview_frame)
+                self.assertIsNone(worker.preview_frame)
                 if format == "gif":
                     with Image.open(output) as gif:
                         self.assertEqual(gif.n_frames, 10)

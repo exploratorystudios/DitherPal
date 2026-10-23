@@ -12,7 +12,8 @@ os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 import cv2
 import numpy as np
 from PIL import Image
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QCoreApplication, QEvent, QSettings
+from PyQt6 import sip
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QSlider
 
@@ -65,6 +66,55 @@ class NeuralDepthTests(unittest.TestCase):
                 infer_depth(rgb, self.root/'model.onnx')
                 infer_depth(rgb, self.root/'model.onnx')
                 self.assertEqual(session.call_count, 1)
+                options = session.call_args.args[1]
+                self.assertFalse(options.enable_cpu_mem_arena)
+                self.assertFalse(options.enable_mem_pattern)
+
+    def test_source_cache_stays_bounded_across_many_images(self):
+        from ditherpal_depth import model
+        predicted = np.linspace(0, 1, 48*64, dtype=np.float32).reshape(48, 64)
+        with patch('ditherpal_depth.model.infer_depth', return_value=predicted):
+            for index in range(12):
+                source = self.root/f'photo-{index}.png'
+                Image.new('RGB', (64, 48), 'blue').save(source)
+                image_and_depth(source)
+                self.assertLessEqual(len(model._files), 4)
+        self.assertTrue(all('photo-' in key[0] for key in model._files))
+
+    def test_repeated_gui_renders_release_worker_buffers_on_success_and_error(self):
+        settings = QSettings(str(self.root/'memory-settings.ini'), QSettings.Format.IniFormat)
+        with patch('ditherpal.QSettings', return_value=settings):
+            window = DitherApp()
+        window.current_image_path = str(self.source)
+        window.pixel_art_combo.setCurrentIndex(1)
+        near = np.full((48, 64), .7, np.float32)
+        try:
+            with patch('ditherpal.QMessageBox.information'), patch('ditherpal.QMessageBox.critical') as error:
+                for failure in (False, False, True):
+                    with patch('ditherpal.neural_depth_for_file', side_effect=RuntimeError('Model failed') if failure else None,
+                               return_value=near):
+                        window.process_image()
+                        worker = window.worker_thread
+                        deadline = time.monotonic()+15
+                        while window.worker_thread is not None and time.monotonic() < deadline:
+                            QTest.qWait(10)
+                        self.assertIsNone(window.worker_thread)
+                        self.assertTrue(window.process_btn.isEnabled())
+                        self.assertIsNone(worker.source_depth)
+                        self.assertIsNone(worker.preview_frame)
+                        self.assertIsNone(worker.locked_palette)
+                        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+                        self.assertTrue(sip.isdeleted(worker))
+                error.assert_called_once()
+            self.assertTrue(Path(window.current_result_path).is_file())
+            self.assertTrue(window.view_btn.isEnabled())
+        finally:
+            if window.worker_thread is not None:
+                window.worker_thread.requestInterruption()
+                window.worker_thread.wait()
+                self.qt.processEvents()
+            window.close()
+            window.deleteLater()
 
     def test_both_pixel_art_styles_and_color_modes_receive_neural_depth(self):
         near = np.array([[0, .5], [.75, 1]], np.float32)
