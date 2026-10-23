@@ -7,31 +7,9 @@ and the textured 3D surface used for camera animation.
 
 ## Examples
 
-### Retro
-
-Flat color bands and checkerboard seams in a fjord landscape. Click either image
-to inspect it at full size.
-
-| Original | Retro |
-| --- | --- |
-| [![Original fjord landscape](media/comparisons/fjord.jpg)](media/comparisons/fjord.jpg) | [![Fjord rendered with Retro pixel art](media/comparisons/fjord_Retro.jpg)](media/comparisons/fjord_Retro.jpg) |
-
-Photo: [Alexey Topolyanskiy / Unsplash](https://unsplash.com/photos/-oWyJoSqBRM).
-
-### High Res
-
-Fine dithered shading across a city skyline at sunset. Click either image
-to inspect it at full size.
-
-| Original | High Res |
-| --- | --- |
-| [![Original city skyline at sunset](media/comparisons/city_skyline_sunset.jpg)](media/comparisons/city_skyline_sunset.jpg) | [![City skyline rendered with High Res pixel art](media/comparisons/city_skyline_sunset_High-Res.jpg)](media/comparisons/city_skyline_sunset_High-Res.jpg) |
-
-Photo: [Kevin Young / Unsplash](https://unsplash.com/photos/-icmOdYWXuQ).
-
-The following older examples illustrate other dither styles and predate neural depth becoming the default.
-
 ### Still Image
+
+These still-image examples predate neural depth becoming the default.
 
 <table>
   <tr>
@@ -48,20 +26,27 @@ The following older examples illustrate other dither styles and predate neural d
 
 ### Pixel Art Mode
 
-Same photo, **Pixel Art Mode + Cel Shading** — the only thing changed between the two results is the **Upscale Factor**:
+#### Retro
 
-<table>
-  <tr>
-    <th>Original</th>
-    <th>Pixel Art — 2× upscale</th>
-    <th>Pixel Art — 4× upscale ⭐</th>
-  </tr>
-  <tr>
-    <td><img src="media/img2.webp" width="571" height="761"></td>
-    <td><img src="media/dithered/img2_pixelart_2x.webp" width="571" height="761"></td>
-    <td><img src="media/dithered/img2_pixelart_4x.webp" width="571" height="761"></td>
-  </tr>
-</table>
+Flat color bands and checkerboard seams in a fjord landscape. Click either image
+to inspect it at full size.
+
+| Original | Retro |
+| --- | --- |
+| [![Original fjord landscape](media/comparisons/fjord.jpg)](media/comparisons/fjord.jpg) | [![Fjord rendered with Retro pixel art](media/comparisons/fjord_Retro.jpg)](media/comparisons/fjord_Retro.jpg) |
+
+Photo: [Alexey Topolyanskiy / Unsplash](https://unsplash.com/photos/-oWyJoSqBRM).
+
+#### High Res
+
+Fine dithered shading across a city skyline at sunset. Click either image
+to inspect it at full size.
+
+| Original | High Res |
+| --- | --- |
+| [![Original city skyline at sunset](media/comparisons/city_skyline_sunset.jpg)](media/comparisons/city_skyline_sunset.jpg) | [![City skyline rendered with High Res pixel art](media/comparisons/city_skyline_sunset_High-Res.jpg)](media/comparisons/city_skyline_sunset_High-Res.jpg) |
+
+Photo: [Kevin Young / Unsplash](https://unsplash.com/photos/-icmOdYWXuQ).
 
 > [!TIP]
 > **Crank up the upscale factor!** Pixel Art Mode starts you at 2×, but **4× and beyond is where it really shines** — every step up gives you finer art pixels and brings back leaves, edges and small details. See [Pixel art](#pixel-art) below.
