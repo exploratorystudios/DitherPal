@@ -8,10 +8,11 @@ Optimized with Numba JIT compilation and multithreading for maximum performance.
 import sys
 import os
 import shutil
+import re
 from pathlib import Path
 from datetime import datetime
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 import warnings
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1505,6 +1506,96 @@ def write_zoom_svg(path, grids, width, height, seconds):
         f.write("\n".join(out))
 
 
+def comparison_frame(path):
+    """Read a full-resolution still (or the first frame of an animation)."""
+    path = Path(path)
+    if path.suffix.lower() in {pattern[1:] for pattern in VIDEO_FORMATS}:
+        import cv2
+        capture = cv2.VideoCapture(str(path))
+        try:
+            ok, frame = capture.read()
+            if not ok:
+                raise ValueError(f"Could not read a frame from {path.name}")
+            return Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)).convert('RGBA')
+        finally:
+            capture.release()
+    if path.suffix.lower() == '.svg':
+        from PyQt6.QtSvg import QSvgRenderer
+        renderer = QSvgRenderer(str(path))
+        if not renderer.isValid() or renderer.defaultSize().isEmpty():
+            raise ValueError(f"Could not read {path.name}")
+        image = QImage(renderer.defaultSize(), QImage.Format.Format_RGBA8888)
+        image.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(image)
+        try:
+            renderer.render(painter)
+        finally:
+            painter.end()
+        return Image.frombytes('RGBA', (image.width(), image.height()),
+                               image.constBits().asstring(image.sizeInBytes()),
+                               'raw', 'RGBA', image.bytesPerLine())
+    with Image.open(path) as image:
+        return image.convert('RGBA')
+
+
+class ComparisonWorker(QThread):
+    """Save a labeled comparison without blocking the interface."""
+    saved = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, source, result):
+        super().__init__()
+        self.source = Path(source)
+        self.result = Path(result)
+
+    def run(self):
+        destination = None
+        created = False
+        try:
+            original = comparison_frame(self.source)
+            dithered = comparison_frame(self.result)
+            width, height = dithered.size
+            margin = max(12, min(48, height // 40))
+            header = margin * 3
+            panel_width = max(width, margin * 16)  # Leave room for labels on tiny sprites.
+            canvas = Image.new('RGB', (panel_width * 2 + margin * 3, height + header + margin), 'white')
+            original = ImageOps.contain(original, (width, height), Image.Resampling.LANCZOS)
+            canvas.paste(original, (margin + (panel_width - original.width) // 2,
+                                    header + (height - original.height) // 2), original)
+            canvas.paste(dithered, (panel_width + margin * 2 + (panel_width - width) // 2, header), dithered)
+            try:
+                font = ImageFont.truetype('DejaVuSans.ttf', max(14, margin))
+            except OSError:
+                font = ImageFont.load_default()
+            draw = ImageDraw.Draw(canvas)
+            animation = self.result.suffix.lower() in {p[1:] for p in VIDEO_FORMATS} | {'.gif', '.svg'}
+            suffix = ' (first frame)' if animation else ''
+            draw.text((margin, margin), 'Original' + suffix, fill='#222222', font=font)
+            draw.text((panel_width + margin * 2, margin), 'Dithered' + suffix, fill='#222222', font=font)
+            folder = self.result.parent / 'Comparisons'
+            folder.mkdir(exist_ok=True)
+            counter = 0
+            while True:
+                suffix = f'_{counter}' if counter else ''
+                destination = folder / f'{self.result.stem}_comparison{suffix}.png'
+                try:
+                    target = destination.open('xb')
+                    created = True
+                    break
+                except FileExistsError:
+                    counter += 1
+            with target:
+                canvas.save(target, 'PNG')
+            self.saved.emit(str(destination))
+        except Exception as error:
+            if created:
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self.error.emit(str(error))
+
+
 class StreamingGifWriter:
     """Encode one indexed GIF frame at a time, keeping memory independent of clip length."""
 
@@ -2952,8 +3043,11 @@ class DitherApp(QMainWindow):
         self.worker_thread = None
         self.current_result_path = None
         self.viewer_launches = set()
+        self.comparison_worker = None
+        self.close_after_comparison = False
         self.result_settings = QSettings("DitherPal", "DitherPal")
         self.recent_results = self.result_settings.value("recent_results", [], type=list)
+        self.result_sources = self.result_settings.value("result_sources", {}, type=dict)
         self.setWindowTitle("DitherPal - Floyd-Steinberg Dithering Tool")
         self.setGeometry(100, 100, 1400, 900)
         self.setStyleSheet(self.get_stylesheet())
@@ -3504,7 +3598,11 @@ class DitherApp(QMainWindow):
         self.recent_btn = QPushButton("Recent")
         self.recent_btn.setToolTip("Browse recent dithers and click one to preview it")
         self.recent_btn.clicked.connect(self.show_recent_results)
-        for button in (self.view_btn, self.finalize_btn, self.recent_btn):
+        self.comparison_btn = QPushButton("Comparison")
+        self.comparison_btn.setToolTip("Save original and selected dither side by side in Comparisons")
+        self.comparison_btn.clicked.connect(self.save_comparison)
+        self.comparison_btn.setEnabled(False)
+        for button in (self.view_btn, self.finalize_btn, self.comparison_btn, self.recent_btn):
             result_actions.addWidget(button)
         after_layout.addLayout(result_actions)
         after_group.setLayout(after_layout)
@@ -4059,17 +4157,23 @@ class DitherApp(QMainWindow):
         self.progress_label.setText("✓ Complete!")
         
         # Track the completed file independently of the current input or worker.
-        self.remember_result(output_path)
+        source = getattr(self.worker_thread, "input_path", None) or self.current_image_path
+        self.remember_result(output_path, source)
         self.show_after_preview(output_path)
         
         QMessageBox.information(self, "Success", message)
     
-    def remember_result(self, output_path):
+    def remember_result(self, output_path, source_path=None):
         """Persist a bounded list of successful outputs across app launches."""
         path = str(Path(output_path).resolve())
         self.recent_results = [path] + [p for p in self.recent_results if p != path]
         self.recent_results = self.recent_results[:100]
         self.result_settings.setValue("recent_results", self.recent_results)
+        if source_path:
+            self.result_sources[path] = str(Path(source_path).resolve())
+        self.result_sources = {p: source for p, source in self.result_sources.items()
+                               if p in self.recent_results}
+        self.result_settings.setValue("result_sources", self.result_sources)
 
     def selected_result(self):
         """Validate the selected file again: it may have been moved or deleted."""
@@ -4078,8 +4182,62 @@ class DitherApp(QMainWindow):
             QMessageBox.warning(self, "Result unavailable", "This result is no longer available. Choose another from Recent.")
             self.view_btn.setEnabled(False)
             self.finalize_btn.setEnabled(False)
+            self.comparison_btn.setEnabled(False)
             return None
         return path
+
+    def save_comparison(self):
+        result = self.selected_result()
+        if result is None or self.comparison_worker is not None:
+            return
+        source_path = self.result_sources.get(str(result))
+        # Earlier outputs have no saved association. Use the current input only
+        # when both its directory and the generated filename match this result.
+        if not source_path and self.current_image_path:
+            current = Path(self.current_image_path).resolve()
+            matches_name = re.fullmatch(
+                re.escape(current.stem) + r'_(?:dithered|zoom)(?:_bw|_fullcolor|_custom\d+c)?(?:_\d+)?',
+                result.stem)
+            if result.parent == current.parent / 'dithered' and matches_name:
+                source_path = str(current)
+        if not source_path or not Path(source_path).is_file():
+            source_path, _ = QFileDialog.getOpenFileName(
+                self, "Choose the original for this comparison", str(result.parent.parent), MEDIA_FILTER)
+            if not source_path:
+                return
+        self.remember_result(result, source_path)
+        self.comparison_btn.setEnabled(False)
+        self.comparison_btn.setText("Saving…")
+        self.status_label.setText("Saving comparison…")
+        worker = ComparisonWorker(source_path, result)
+        self.comparison_worker = worker
+        worker.saved.connect(self.on_comparison_saved)
+        worker.error.connect(self.on_comparison_error)
+        worker.finished.connect(self.on_comparison_finished)
+        worker.finished.connect(worker.deleteLater)
+        worker.start()
+
+    def on_comparison_saved(self, path):
+        self.status_label.setText(f"Comparison saved to:\n{path}")
+
+    def on_comparison_error(self, message):
+        self.status_label.setText("Could not save comparison")
+        QMessageBox.warning(self, "Could not save comparison", message)
+
+    def on_comparison_finished(self):
+        self.comparison_worker = None
+        self.comparison_btn.setText("Comparison")
+        self.comparison_btn.setEnabled(bool(self.current_result_path and Path(self.current_result_path).is_file()))
+        if self.close_after_comparison:
+            self.close()
+
+    def closeEvent(self, event):
+        if self.comparison_worker is not None:
+            self.close_after_comparison = True
+            self.status_label.setText("Finishing comparison before closing…")
+            event.ignore()
+            return
+        super().closeEvent(event)
 
     def view_result(self):
         path = self.selected_result()
@@ -4213,6 +4371,7 @@ class DitherApp(QMainWindow):
         available = path.is_file()
         self.view_btn.setEnabled(available)
         self.finalize_btn.setEnabled(available)
+        self.comparison_btn.setEnabled(available and self.comparison_worker is None)
         self.result_label.setText(path.name)
         self.result_label.setToolTip(str(path))
         try:

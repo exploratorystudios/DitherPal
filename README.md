@@ -111,6 +111,11 @@ python ditherpal.py
 Under **Dithered Result**, use **View** to open the selected output in your default
 image or media viewer. **Finalize** keeps a copy in `dithered/Finalized/` beside
 the working outputs; existing favorites are preserved with numbered filenames.
+**Comparison** saves a labeled, side-by-side PNG of the original and selected
+dither in `dithered/Comparisons/`, using a unique filename each time. The dither
+keeps its full resolution; the original fits alongside it without cropping.
+For videos and animations, the comparison uses the first frame. If an older
+result has no known original, you can select it when creating the comparison.
 **Recent** lists the latest 100 available dithers, including earlier outputs in
 the current source's `dithered/` folder. Click a version to show it in the result
 preview, then view or finalize that version. Recent outputs are remembered across

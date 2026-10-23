@@ -13,7 +13,7 @@ from PyQt6.QtCore import QSettings, QTimer
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QListWidget
 
-from ditherpal import DitherApp
+from ditherpal import DitherApp, ComparisonWorker
 
 
 class ResultActionsTest(unittest.TestCase):
@@ -93,6 +93,74 @@ class ResultActionsTest(unittest.TestCase):
         self.assertEqual((folder / "favorite_1.png").read_bytes(), original)
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(self.window.recent_result_paths(), [path])
+
+    def wait_for_comparison(self):
+        deadline = time.monotonic() + 5
+        while self.window.comparison_worker is not None and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertIsNone(self.window.comparison_worker)
+
+    def test_comparison_uses_recorded_original_and_preserves_existing_exports(self):
+        source = self.root / "original.png"
+        Image.new("RGB", (64, 48), "red").save(source)
+        result = self.image("blue.png", "blue")
+        self.window.remember_result(result, source)
+        self.window.current_image_path = str(self.root / "another-original.png")
+        self.window.show_after_preview(result)
+        with patch("ditherpal.QFileDialog.getOpenFileName") as choose:
+            self.window.comparison_btn.click()
+            self.wait_for_comparison()
+            choose.assert_not_called()
+        folder = self.outputs / "Comparisons"
+        comparison = folder / "blue_comparison.png"
+        original_export = comparison.read_bytes()
+        with Image.open(comparison) as image:
+            # Native dither is 32x24; each panel has a 192px minimum for labels.
+            self.assertEqual(image.size, (420, 72))
+            self.assertEqual(image.getpixel((108, 48)), (255, 0, 0))
+            self.assertEqual(image.getpixel((312, 48)), (0, 0, 255))
+        self.window.comparison_btn.click()
+        self.wait_for_comparison()
+        self.assertTrue((folder / "blue_comparison_1.png").is_file())
+        self.assertEqual(comparison.read_bytes(), original_export)
+        self.assertEqual(self.window.current_result_path, str(result))
+        self.assertEqual(self.window.recent_result_paths(), [result])
+        self.settings.sync()
+        fresh = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
+        self.assertEqual(fresh.value("result_sources", {}, type=dict)[str(result)], str(source))
+
+    def test_comparison_recognizes_older_output_for_current_source(self):
+        source = self.root / "source.png"
+        Image.new("RGB", (64, 48), "red").save(source)
+        result = self.image("source_dithered_fullcolor_3.png", "blue")
+        self.window.show_after_preview(result)
+        with patch("ditherpal.QFileDialog.getOpenFileName") as choose:
+            self.window.save_comparison()
+            self.wait_for_comparison()
+        choose.assert_not_called()
+        self.assertEqual(self.window.result_sources[str(result)], str(source))
+
+    def test_unknown_original_is_requested_and_cancel_does_not_export(self):
+        source = self.root / "source.png"
+        Image.new("RGB", (64, 48), "red").save(source)
+        result = self.image("source_dithered_other_dithered_bw.png", "blue")
+        self.window.show_after_preview(result)
+        with patch("ditherpal.QFileDialog.getOpenFileName", return_value=("", "")) as choose:
+            self.window.save_comparison()
+        choose.assert_called_once()
+        self.assertIsNone(self.window.comparison_worker)
+        self.assertFalse((self.outputs / "Comparisons").exists())
+
+    def test_failed_comparison_removes_partial_export(self):
+        source = self.image("red.png", "red")
+        result = self.image("blue.png", "blue")
+        worker = ComparisonWorker(source, result)
+        errors = []
+        worker.error.connect(errors.append)
+        with patch("PIL.Image.Image.save", side_effect=OSError("Disk full")):
+            worker.run()
+        self.assertEqual(errors, ["Disk full"])
+        self.assertEqual(list((self.outputs / "Comparisons").iterdir()), [])
 
     def test_view_uses_async_gio_without_stale_startup_tokens(self):
         path = self.image("version with spaces.png", "red")
