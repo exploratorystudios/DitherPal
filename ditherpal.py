@@ -3348,6 +3348,13 @@ class DitherApp(QMainWindow):
         self.pixel_warning_label.setStyleSheet(
             "color: #fbbf24; background-color: rgba(251, 191, 36, 0.12); "
             "border: 1px solid rgba(251, 191, 36, 0.5); border-radius: 6px; padding: 6px 8px;")
+        # Reserve two lines even while hidden so warnings never shift the settings.
+        self.pixel_warning_label.ensurePolished()
+        self.pixel_warning_label.setFixedHeight(
+            self.pixel_warning_label.fontMetrics().lineSpacing() * 2 + 14)
+        warning_policy = self.pixel_warning_label.sizePolicy()
+        warning_policy.setRetainSizeWhenHidden(True)
+        self.pixel_warning_label.setSizePolicy(warning_policy)
         self.pixel_warning_label.hide()
         left_panel.addWidget(self.pixel_warning_label)
 
