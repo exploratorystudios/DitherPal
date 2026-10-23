@@ -24,6 +24,27 @@ These still-image examples predate neural depth becoming the default.
   </tr>
 </table>
 
+### Video (Click to watch)
+
+<table>
+  <tr>
+    <th>Original</th>
+    <th>B&W Dither</th>
+    <th>Full Color Dither</th>
+  </tr>
+  <tr>
+    <td>
+      <a href="https://youtu.be/6NttwZXAyww"><img src="https://img.youtube.com/vi/6NttwZXAyww/maxresdefault.jpg" width="1280" height="720"></a>
+    </td>
+    <td>
+      <a href="https://youtu.be/xMnGWsTfyyQ"><img src="https://img.youtube.com/vi/xMnGWsTfyyQ/maxresdefault.jpg" width="1280" height="720"></a>
+    </td>
+    <td>
+      <a href="https://youtu.be/3B4rneGYVPo"><img src="https://img.youtube.com/vi/3B4rneGYVPo/maxresdefault.jpg" width="1280" height="720"></a>
+    </td>
+  </tr>
+</table>
+
 ### Pixel Art Mode
 
 #### Retro
@@ -50,27 +71,6 @@ Photo: [Kevin Young / Unsplash](https://unsplash.com/photos/-icmOdYWXuQ).
 
 > [!TIP]
 > **Crank up the upscale factor!** Pixel Art Mode starts you at 2×, but **4× and beyond is where it really shines** — every step up gives you finer art pixels and brings back leaves, edges and small details. See [Pixel art](#pixel-art) below.
-
-### Video (Click to watch)
-
-<table>
-  <tr>
-    <th>Original</th>
-    <th>B&W Dither</th>
-    <th>Full Color Dither</th>
-  </tr>
-  <tr>
-    <td>
-      <a href="https://youtu.be/6NttwZXAyww"><img src="https://img.youtube.com/vi/6NttwZXAyww/maxresdefault.jpg" width="1280" height="720"></a>
-    </td>
-    <td>
-      <a href="https://youtu.be/xMnGWsTfyyQ"><img src="https://img.youtube.com/vi/xMnGWsTfyyQ/maxresdefault.jpg" width="1280" height="720"></a>
-    </td>
-    <td>
-      <a href="https://youtu.be/3B4rneGYVPo"><img src="https://img.youtube.com/vi/3B4rneGYVPo/maxresdefault.jpg" width="1280" height="720"></a>
-    </td>
-  </tr>
-</table>
 
 ---
 
