@@ -72,9 +72,9 @@ Same photo, **Pixel Art Mode + Cel Shading** — the only thing changed between 
 - **Color modes** — Black & White, Full Color Spectrum, Custom palette
 - **Infinite upscaling** — Super-sample before dithering for ultra-sharp output at any resolution (and finer pixel art)
 - **Downscale (Pixelate)** — Dither at a fraction of the size, then scale back up with hard pixel edges
-- **Video support** — Process MP4, AVI, MOV, MKV, WebM and more; outputs upscaled dithered MP4
+- **Video support** — Process MP4, AVI, MOV, MKV, WebM and more; export dithered MP4 or animated GIF
 - **Numba JIT acceleration** — Compiled dithering kernels for near-native CPU performance
-- **Multithreaded video processing** — Parallel frame batches scale to available CPU cores
+- **Multithreaded video processing** — Memory-bounded batches reuse a thread pool; optional first-frame palette locking avoids repeated color fitting
 
 ---
 
@@ -115,6 +115,13 @@ the working outputs; existing favorites are preserved with numbered filenames.
 the current source's `dithered/` folder. Click a version to show it in the result
 preview, then view or finalize that version. Recent outputs are remembered across
 launches. Selecting a result leaves your source image and processing settings in place.
+
+For imported videos and GIFs, choose **Video / GIF output** in the Image panel.
+**Lock video palette to first frame** is enabled by default for steadier colors and
+less repeated work. Turn it off when later scenes introduce colors absent from the
+first frame. GIF export writes frames incrementally instead of keeping the whole
+clip in memory. GIF supports at most 256 colors per frame and centisecond timing;
+exporting as GIF does not inherently make dithering faster than MP4.
 
 ---
 

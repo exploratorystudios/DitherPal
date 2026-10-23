@@ -164,6 +164,19 @@ class ResultActionsTest(unittest.TestCase):
         self.assertTrue(self.window.recent_results[0].endswith("result_104.png"))
         self.assertTrue(self.window.recent_results[-1].endswith("result_5.png"))
 
+    def test_video_output_format_gets_unique_filename_before_processing(self):
+        self.window.current_image_path = str(self.root / "source.avi")
+        existing = self.outputs / "source_dithered_bw.gif"
+        existing.write_bytes(b"existing output")
+        self.window.video_format_combo.setCurrentIndex(1)
+        self.window.video_palette_check.setChecked(False)
+        with patch("ditherpal.DitherWorker") as worker:
+            self.window.process_image()
+        args = worker.call_args.args
+        self.assertEqual(args[1], str(self.outputs / "source_dithered_bw_1.gif"))
+        self.assertEqual(args[-2:], ("gif", False))
+        self.assertEqual(existing.read_bytes(), b"existing output")
+
     def test_svg_reloads_without_worker(self):
         path = self.outputs / "animation.svg"
         path.write_text('<svg xmlns="http://www.w3.org/2000/svg" width="32" height="24">'

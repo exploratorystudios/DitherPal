@@ -1505,6 +1505,41 @@ def write_zoom_svg(path, grids, width, height, seconds):
         f.write("\n".join(out))
 
 
+class StreamingGifWriter:
+    """Encode one indexed GIF frame at a time, keeping memory independent of clip length."""
+
+    def __init__(self, path, fps):
+        self.file = open(path, "wb")
+        self.fps = fps
+        self.frame_count = 0
+
+    def write(self, rgb):
+        from PIL import GifImagePlugin
+
+        image = Image.fromarray(rgb)
+        # Per-frame GIF tables preserve newly appearing colors, even after a black first frame.
+        # The renderer controls palette locking; the encoder must not silently drop its colors.
+        indexed = image.quantize(colors=256, dither=Image.Dither.NONE)
+        if self.frame_count == 0:
+            header, _ = GifImagePlugin.getheader(indexed, info={"loop": 0, "optimize": False})
+            for block in header:
+                self.file.write(block)
+        # Distribute centisecond rounding instead of accumulating timing drift.
+        start = round(self.frame_count * 100 / self.fps)
+        end = round((self.frame_count + 1) * 100 / self.fps)
+        duration = max(1, end - start) * 10
+        for block in GifImagePlugin.getdata(indexed, duration=duration, disposal=1,
+                                          include_color_table=self.frame_count > 0):
+            self.file.write(block)
+        self.frame_count += 1
+
+    def release(self):
+        if not self.file.closed:
+            if self.frame_count:
+                self.file.write(b";")
+            self.file.close()
+
+
 class DitherWorker(QThread):
     """Worker thread for dithering"""
     progress = pyqtSignal(int)
@@ -1516,7 +1551,7 @@ class DitherWorker(QThread):
                  use_grayscale=False, color_mode="bw", custom_colors=None, text_pattern="",
                  restore_size=True, hybrid_strength=0.5, hybrid_cell=4, hybrid_style="grid",
                  cel_shade=False, cel_colors=24, cel_outlines=False, cel_dither=0.35,
-                 restore_upscale=False, pixel_art_style="off", zoom_format="off"):
+                 restore_upscale=False, pixel_art_style="off", zoom_format="off", video_format="mp4", lock_video_palette=True):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
@@ -1539,6 +1574,10 @@ class DitherWorker(QThread):
         self.cel_dither = cel_dither  # Grid style: checkerboard between color bands on gradients (0-1)
         self.pixel_art_style = pixel_art_style  # "off", "high_res" (Ferrari-style) or "retro" (Gen 3-style)
         self.zoom_format = zoom_format  # 3D zoom animation of a still image: "off", "gif", "mp4" or "svg"
+        self.video_format = video_format
+        self.lock_video_palette = lock_video_palette
+        self.frame_executor = None
+        self.video_palette_seeded = False
         self.lock_palette = False  # Animation frames reuse the first frame's pixel art palette
         self.locked_palette = None
         self.locked_color_palette = None  # Full-color palette of the first animation frame
@@ -2281,144 +2320,118 @@ class DitherWorker(QThread):
         self.finished.emit(f"Successfully saved animated GIF ({num_frames} frames) to:\n{self.output_path}", str(self.output_path))
     
     def process_video(self, video_path):
-        """Process video files with GPU-accelerated batch processing"""
+        """Decode, dither in bounded batches, and stream frames to MP4 or GIF."""
+        import cv2
+
+        cap, out = None, None
+        self.lock_palette = self.lock_video_palette
+        self.video_palette_seeded = False
+        self.locked_palette = self.locked_color_palette = None
         try:
-            import cv2
-        except ImportError:
-            self.error.emit("OpenCV (cv2) is required for video processing. Install with: pip install opencv-python")
-            return
-        
-        try:
-            # Open video file
             cap = cv2.VideoCapture(video_path)
             if not cap.isOpened():
-                self.error.emit(f"Failed to open video file: {video_path}")
-                return
-            
-            # Get video properties
+                raise ValueError(f"Failed to open video file: {video_path}")
             fps = cap.get(cv2.CAP_PROP_FPS)
+            fps = fps if np.isfinite(fps) and fps > 0 else 25.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            
+            if width <= 0 or height <= 0:
+                raise ValueError("Video has invalid dimensions")
             self.status.emit(f"Processing video: {total_frames} frames @ {fps:.2f} FPS ({width}x{height})")
-            
-            # Calculate dithering dimensions (downscaled, then upscaled if requested)
-            dither_width = max(1, width // self.downscale) * self.upsample
-            dither_height = max(1, height // self.downscale) * self.upsample
-
-            # Output dimensions: original size if restoring a pixelated or upscaled video
-            if (self.downscale > 1 and self.restore_size) or (self.restore_upscale and self.upsample > 1):
-                out_width, out_height = width, height
+            source_size = (max(1, width // self.downscale), max(1, height // self.downscale))
+            dither_size = (source_size[0] * self.upsample, source_size[1] * self.upsample)
+            output_size = self._output_size(*source_size, (width, height))
+            if self.video_format == "mp4":
+                output_size = tuple(max(2, n + n % 2) for n in output_size)
+            output_path = str(Path(self.output_path).with_suffix('.' + self.video_format))
+            if self.video_format == "gif":
+                out = StreamingGifWriter(output_path, fps)
             else:
-                out_width, out_height = dither_width, dither_height
-
-            # Setup video writer - always output as MP4
-            output_path = str(Path(self.output_path).with_suffix('.mp4'))
-
-            # Use H.264 codec for better compatibility
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
-
-            if not out.isOpened():
-                self.error.emit(f"Failed to create output video file: {output_path}")
-                cap.release()
-                return
-
-            if self.art_block:
-                work_w, work_h = self._setup_pixel_art_grid(max(1, width // self.downscale),
-                                                            max(1, height // self.downscale))
-                frame_bytes = work_w * work_h * 3 * 16 + out_width * out_height * 3 * 2
-            else:
-                frame_bytes = dither_width * dither_height * 3 * 8 + out_width * out_height * 3 * 2
-
-            # Process frames in parallel batches, as many as fit in half the free memory
-            # (an upscaled frame can take a gigabyte or more while it is dithered)
+                out = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, output_size)
+                if not out.isOpened():
+                    raise ValueError(f"Failed to create output video file: {output_path}")
+            work_size = self._setup_pixel_art_grid(*source_size) if self.art_block else dither_size
+            frame_bytes = work_size[0] * work_size[1] * 3 * 16 + output_size[0] * output_size[1] * 6
             batch_size = int(max(1, min(8, self._get_available_memory() * 0.5 // frame_bytes)))
-            frame_batch = []
-            frame_count = 0
-
+            self.frame_executor = ThreadPoolExecutor(max_workers=min(batch_size, NUM_CORES))
+            frame_batch, frame_count = [], 0
             while True:
                 ret, frame = cap.read()
                 if ret:
-                    # Convert BGR to RGB, then downscale and/or upscale if requested
-                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     if self.downscale > 1:
-                        frame_rgb = cv2.resize(frame_rgb, (max(1, width // self.downscale), max(1, height // self.downscale)),
-                                               interpolation=cv2.INTER_AREA)
+                        rgb = cv2.resize(rgb, source_size, interpolation=cv2.INTER_AREA)
                     if self.art_block:
-                        frame_rgb = np.array(self._resize_to_work(Image.fromarray(frame_rgb), (work_w, work_h)))
+                        rgb = np.asarray(self._resize_to_work(Image.fromarray(rgb), work_size))
                     elif self.upsample > 1:
-                        pil_frame = self.smart_resize(Image.fromarray(frame_rgb), (dither_width, dither_height))
-                        frame_rgb = np.array(pil_frame)
-                    frame_batch.append(frame_rgb)
-                
-                # Process batch when full, and whatever is left at the end
+                        rgb = np.asarray(self.smart_resize(Image.fromarray(rgb), work_size))
+                    frame_batch.append(rgb)
                 if frame_batch and (len(frame_batch) >= batch_size or not ret):
-                    # Process batch with parallel/GPU acceleration
-                    dithered_batch = self.process_frame_batch(frame_batch)
-                    
-                    # Write processed frames
-                    for dithered_frame in dithered_batch:
+                    for rendered in self.process_frame_batch(frame_batch):
                         if self.art_block:
-                            dithered_frame = self._pixel_art_to_size(dithered_frame, (out_width, out_height))
-                        # Scale pixelated frame back up with hard pixel edges
-                        if (dithered_frame.shape[1], dithered_frame.shape[0]) != (out_width, out_height):
-                            dithered_frame = cv2.resize(dithered_frame, (out_width, out_height),
-                                                        interpolation=cv2.INTER_NEAREST)
-                        # Convert RGB back to BGR for OpenCV
-                        frame_bgr = cv2.cvtColor(dithered_frame, cv2.COLOR_RGB2BGR)
-                        out.write(frame_bgr)
-                    
+                            rendered = self._pixel_art_to_size(rendered, output_size)
+                        if (rendered.shape[1], rendered.shape[0]) != output_size:
+                            rendered = cv2.resize(rendered, output_size, interpolation=cv2.INTER_NEAREST)
+                        if self.preview_frame is None:
+                            self.preview_frame = rendered.copy()
+                        if self.video_format == "gif":
+                            out.write(rendered)
+                        else:
+                            out.write(cv2.cvtColor(rendered, cv2.COLOR_RGB2BGR))
                     frame_count += len(frame_batch)
-                    progress = int((frame_count / total_frames) * 100)
+                    progress = min(99, int(frame_count * 100 / total_frames)) if total_frames > 0 else 0
                     self.progress.emit(progress)
-                    self.status.emit(f"Processing frame {frame_count}/{total_frames} ({progress}%)")
-                    
-                    frame_batch = []
-                    dithered_batch = None
+                    self.status.emit(f"Processing frame {frame_count}/{total_frames or '?'} ({progress}%)")
+                    frame_batch.clear()
                 if not ret:
                     break
-            
-            # Release resources
-            cap.release()
+            if frame_count == 0:
+                raise ValueError("No readable frames in this video")
             out.release()
-            
+            out = None
             self.progress.emit(100)
-            self.finished.emit(f"Successfully processed video ({total_frames} frames) to:\n{output_path}", output_path)
-            
-        except Exception as e:
-            self.error.emit(f"Error processing video: {str(e)}")
-    
+            self.finished.emit(f"Successfully processed video ({frame_count} frames) to:\n{output_path}", output_path)
+        except Exception as error:
+            self.error.emit(f"Error processing video: {error}")
+        finally:
+            if self.frame_executor is not None:
+                self.frame_executor.shutdown(wait=True)
+                self.frame_executor = None
+            if cap is not None:
+                cap.release()
+            if out is not None:
+                out.release()
+            self.lock_palette = False
+            self.locked_palette = self.locked_color_palette = None
+
     def process_frame_batch(self, frames):
-        """Process a batch of frames with parallel processing"""
-        dithered_frames = []
-        
-        # Use ThreadPoolExecutor for parallel frame processing
-        with ThreadPoolExecutor(max_workers=min(len(frames), NUM_CORES)) as executor:
-            # Convert frames to PIL Images
-            pil_frames = [Image.fromarray(frame) for frame in frames]
-            
-            # Process frames in parallel
-            futures = [executor.submit(self.apply_dithering, frame, self.method, self.levels) 
-                      for frame in pil_frames]
-            
-            # Collect results
-            for future in futures:
-                dithered_array = future.result()
-                
-                # Ensure correct format
-                if len(dithered_array.shape) == 2:
-                    # Grayscale to RGB
-                    dithered_array = np.stack([dithered_array] * 3, axis=-1)
-                elif dithered_array.shape[2] == 4:
-                    # RGBA to RGB
-                    dithered_array = dithered_array[:, :, :3]
-                
-                dithered_frames.append(dithered_array.astype(np.uint8))
-        
-        return dithered_frames
-    
+        """Process raw arrays with a persistent pool and a race-free palette seed."""
+        if not frames:
+            return []
+        results = []
+        if self.lock_palette and not self.video_palette_seeded:
+            results.append(self.apply_dithering(frames[0], self.method, self.levels))
+            self.video_palette_seeded = True
+            frames = frames[1:]
+        if frames:
+            if self.frame_executor is None:
+                results.extend(self.apply_dithering(frame, self.method, self.levels) for frame in frames)
+            else:
+                futures = [self.frame_executor.submit(self.apply_dithering, frame, self.method, self.levels)
+                           for frame in frames]
+                results.extend(future.result() for future in futures)
+        normalized = []
+        for result in results:
+            if result.ndim == 2:
+                result = np.repeat(result[..., None], 3, axis=2)
+            elif result.shape[2] == 1:
+                result = np.repeat(result, 3, axis=2)
+            elif result.shape[2] > 3:
+                result = result[..., :3]
+            normalized.append(result.astype(np.uint8, copy=False))
+        return normalized
+
     def apply_dithering(self, image, method, levels):
         """Apply selected dithering method with ULTRA-HIGH PERFORMANCE optimizations"""
         # Convert to optimal array format
@@ -2747,52 +2760,55 @@ class DitherWorker(QThread):
             masks = self._generate_text_patterns(width, height, self.text_pattern)
             return text_dither_turbo(img_array_uint8, masks)
 
-        # Ultra-fast palette creation for other methods
-        height, width, _ = img_array.shape
-        total_pixels = height * width
-        
-        if total_pixels > 1_000_000:
-            # For large images, use optimized sampling
-            sample_rate = min(0.1, 100_000 / total_pixels)
-            indices = np.random.choice(total_pixels, int(total_pixels * sample_rate), replace=False)
-            y_coords = indices // width
-            x_coords = indices % width
-            sample_pixels = img_array[y_coords, x_coords]
-        else:
-            sample_pixels = img_array.reshape(-1, 3)
+        if method == "hybrid bayer + floyd-steinberg" and self.hybrid_style == "grid" and self.cel_shade:
+            return self._apply_hybrid_grid(img_array, None)
 
-        # Create optimized palette
-        if levels <= 6:
-            # For small palettes, use RGB cube quantization (much faster)
-            step = 255 // (levels - 1) if levels > 1 else 255
-            palette = []
-            for r in range(0, 256, step):
-                for g in range(0, 256, step):
-                    for b in range(0, 256, step):
-                        if len(palette) < levels ** 3:
-                            palette.append([min(r, 255), min(g, 255), min(b, 255)])
-            palette = np.array(palette, dtype=np.float32)
-        else:
-            # For larger palettes, use fast k-means or quantization
-            try:
-                if SKLEARN_AVAILABLE and len(sample_pixels) > 1000:
-                    from sklearn.cluster import KMeans
-                    kmeans = KMeans(n_clusters=min(levels**2, 64), random_state=42, n_init=5)
-                    kmeans.fit(sample_pixels)
-                    palette = kmeans.cluster_centers_.astype(np.float32)
-                else:
-                    raise ImportError  # Use fallback
-            except:
-                # Fast quantization fallback
-                palette = np.array([[r, g, b] for r in np.linspace(0, 255, levels)
-                                              for g in np.linspace(0, 255, levels) 
-                                              for b in np.linspace(0, 255, levels)], dtype=np.float32)
-                palette = palette[:min(256, len(palette))]
-        if self.lock_palette:
-            # Animation: the sampled k-means palette would shift every frame and flicker
-            if self.locked_color_palette is None:
-                self.locked_color_palette = palette
+        if self.lock_palette and self.locked_color_palette is not None:
             palette = self.locked_color_palette
+        else:
+            # Ultra-fast palette creation for other methods
+            height, width, _ = img_array.shape
+            total_pixels = height * width
+
+            if total_pixels > 1_000_000:
+                # For large images, use optimized sampling
+                sample_rate = min(0.1, 100_000 / total_pixels)
+                indices = np.random.choice(total_pixels, int(total_pixels * sample_rate), replace=False)
+                y_coords = indices // width
+                x_coords = indices % width
+                sample_pixels = img_array[y_coords, x_coords]
+            else:
+                sample_pixels = img_array.reshape(-1, 3)
+
+            # Create optimized palette
+            if levels <= 6:
+                # For small palettes, use RGB cube quantization (much faster)
+                step = 255 // (levels - 1) if levels > 1 else 255
+                palette = []
+                for r in range(0, 256, step):
+                    for g in range(0, 256, step):
+                        for b in range(0, 256, step):
+                            if len(palette) < levels ** 3:
+                                palette.append([min(r, 255), min(g, 255), min(b, 255)])
+                palette = np.array(palette, dtype=np.float32)
+            else:
+                # For larger palettes, use fast k-means or quantization
+                try:
+                    if SKLEARN_AVAILABLE and len(sample_pixels) > 1000:
+                        from sklearn.cluster import KMeans
+                        kmeans = KMeans(n_clusters=min(levels**2, 64), random_state=42, n_init=5)
+                        kmeans.fit(sample_pixels)
+                        palette = kmeans.cluster_centers_.astype(np.float32)
+                    else:
+                        raise ImportError  # Use fallback
+                except:
+                    # Fast quantization fallback
+                    palette = np.array([[r, g, b] for r in np.linspace(0, 255, levels)
+                                                  for g in np.linspace(0, 255, levels)
+                                                  for b in np.linspace(0, 255, levels)], dtype=np.float32)
+                    palette = palette[:min(256, len(palette))]
+            if self.lock_palette:
+                self.locked_color_palette = palette
 
         # Apply method-specific color dithering (rosette handled early above)
         if method == "floyd-steinberg":
@@ -2899,6 +2915,31 @@ class WheelGuard(QObject):
         if event.type() == QEvent.Type.Wheel and not obj.hasFocus():
             QApplication.sendEvent(self.scroll_area.verticalScrollBar(), event)
             return True
+        return super().eventFilter(obj, event)
+
+
+class OverlayWarning(QLabel):
+    """A viewport-pinned warning that occupies no layout space."""
+
+    def __init__(self, viewport):
+        super().__init__(viewport)
+        self.setWordWrap(True)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        viewport.installEventFilter(self)
+        self.hide()
+
+    def position_overlay(self):
+        width = max(1, self.parentWidget().width() - 16)
+        self.setGeometry(8, 8, width, max(self.sizeHint().height(), self.heightForWidth(width)))
+
+    def showEvent(self, event):
+        self.position_overlay()
+        self.raise_()
+        super().showEvent(event)
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Resize:
+            self.position_overlay()
         return super().eventFilter(obj, event)
 
 
@@ -3125,6 +3166,17 @@ class DitherApp(QMainWindow):
                                    "with the chosen method and the same palette")
         zoom_layout.addWidget(self.zoom_combo, 1)
         image_layout.addLayout(zoom_layout)
+        video_layout = QHBoxLayout()
+        video_layout.addWidget(QLabel("Video / GIF output:"))
+        self.video_format_combo = QComboBox()
+        self.video_format_combo.addItems(["MP4 video", "Animated GIF"])
+        self.video_format_combo.setToolTip("Applies to imported videos and GIFs. GIF output is limited to 256 colors per frame.")
+        video_layout.addWidget(self.video_format_combo, 1)
+        image_layout.addLayout(video_layout)
+        self.video_palette_check = QCheckBox("Lock video palette to first frame (faster, steadier colors)")
+        self.video_palette_check.setChecked(True)
+        self.video_palette_check.setToolTip("Reuse the first frame's colors. Turn off for clips with scene changes or new colors.")
+        image_layout.addWidget(self.video_palette_check)
         self.pixel_grid_label.setEnabled(False)
         self.pixel_grid_spin.setEnabled(False)
         image_group.setLayout(image_layout)
@@ -3342,27 +3394,17 @@ class DitherApp(QMainWindow):
         left_layout.addWidget(output_group)
         left_layout.addStretch()
 
-        # Block size / upscale mismatch warning, pinned above the scroll area so it stays in view
-        self.pixel_warning_label = QLabel()
-        self.pixel_warning_label.setWordWrap(True)
-        self.pixel_warning_label.setStyleSheet(
-            "color: #fbbf24; background-color: rgba(251, 191, 36, 0.12); "
-            "border: 1px solid rgba(251, 191, 36, 0.5); border-radius: 6px; padding: 6px 8px;")
-        # Reserve two lines even while hidden so warnings never shift the settings.
-        self.pixel_warning_label.ensurePolished()
-        self.pixel_warning_label.setFixedHeight(
-            self.pixel_warning_label.fontMetrics().lineSpacing() * 2 + 14)
-        warning_policy = self.pixel_warning_label.sizePolicy()
-        warning_policy.setRetainSizeWhenHidden(True)
-        self.pixel_warning_label.setSizePolicy(warning_policy)
-        self.pixel_warning_label.hide()
-        left_panel.addWidget(self.pixel_warning_label)
-
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         settings_scroll.setWidget(settings_widget)
         left_panel.addWidget(settings_scroll, 1)
+
+        # Float over the viewport: no reserved row and no intercepted clicks or scrolling.
+        self.pixel_warning_label = OverlayWarning(settings_scroll.viewport())
+        self.pixel_warning_label.setStyleSheet(
+            "color: #fbbf24; background-color: #332a1b; "
+            "border: 1px solid rgba(251, 191, 36, 0.5); border-radius: 6px; padding: 6px 8px;")
         # The mouse wheel scrolls the panel; a setting only takes the wheel once clicked into
         self.wheel_guard = WheelGuard(settings_scroll, self)
         for control in settings_widget.findChildren((QAbstractSpinBox, QComboBox, QAbstractSlider)):
@@ -3885,7 +3927,11 @@ class DitherApp(QMainWindow):
         
         output_filename = f"{input_path.stem}_dithered{mode_suffix}{input_path.suffix}"
         video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.gif')
-        zoom_format = "off" if input_path.suffix.lower() in video_extensions else self.get_zoom_format()
+        is_video = input_path.suffix.lower() in video_extensions
+        video_format = "gif" if self.video_format_combo.currentIndex() == 1 else "mp4"
+        if is_video:
+            output_filename = f"{input_path.stem}_dithered{mode_suffix}.{video_format}"
+        zoom_format = "off" if is_video else self.get_zoom_format()
         if zoom_format != "off":
             output_filename = f"{input_path.stem}_zoom{mode_suffix}.{zoom_format}"
         base_output_path = dithered_dir / output_filename
@@ -3966,7 +4012,9 @@ class DitherApp(QMainWindow):
             self.cel_dither_spin.value() / 100.0,
             self.restore_upscale_check.isChecked(),
             self.get_pixel_art_style(),
-            zoom_format
+            zoom_format,
+            video_format,
+            self.video_palette_check.isChecked()
         )
         self.worker_thread.progress.connect(self.update_progress)
         self.worker_thread.finished.connect(self.on_finished)
