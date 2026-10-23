@@ -2,13 +2,15 @@
 import os
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
-from PyQt6.QtCore import QSettings
+from PyQt6.QtCore import QSettings, QTimer
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QDialog, QListWidget
 
 from ditherpal import DitherApp
@@ -72,9 +74,10 @@ class ResultActionsTest(unittest.TestCase):
         pixel = self.window.after_preview.pixmap().toImage().pixelColor(0, 0)
         self.assertEqual(pixel.name(), "#0000ff")
         self.assertEqual(self.window.current_image_path, str(self.root / "source.png"))
-        with patch("ditherpal.QDesktopServices.openUrl", return_value=True) as opened:
-            self.window.view_btn.click()
-            self.assertEqual(opened.call_args.args[0].toLocalFile(), str(blue))
+        with patch("ditherpal.shutil.which", return_value=None):
+            with patch("ditherpal.QDesktopServices.openUrl", return_value=True) as opened:
+                self.window.view_btn.click()
+                self.assertEqual(opened.call_args.args[0].toLocalFile(), str(blue))
         self.window.finalize_btn.click()
         self.assertEqual((self.outputs / "Finalized" / blue.name).read_bytes(), blue.read_bytes())
         dialog.close()
@@ -90,6 +93,47 @@ class ResultActionsTest(unittest.TestCase):
         self.assertEqual((folder / "favorite_1.png").read_bytes(), original)
         self.assertEqual(path.read_bytes(), original)
         self.assertEqual(self.window.recent_result_paths(), [path])
+
+    def test_view_uses_async_gio_without_stale_startup_tokens(self):
+        path = self.image("version with spaces.png", "red")
+        self.window.show_after_preview(path)
+        with patch("ditherpal.shutil.which", return_value="/usr/bin/gio"):
+            with patch("ditherpal.QProcess") as process_class:
+                with patch.dict(os.environ, {"DESKTOP_STARTUP_ID": "old-startup", "XDG_ACTIVATION_TOKEN": "old-token"}):
+                    self.window.view_result()
+                process = process_class.return_value
+                process.start.assert_called_once_with("/usr/bin/gio", ["open", str(path)])
+                environment = process.setProcessEnvironment.call_args.args[0]
+                self.assertFalse(environment.contains("DESKTOP_STARTUP_ID"))
+                self.assertFalse(environment.contains("XDG_ACTIVATION_TOKEN"))
+                process.waitForStarted.assert_not_called()
+                process.waitForFinished.assert_not_called()
+                self.window.viewer_launches.clear()
+
+    def run_fake_viewer(self, body):
+        opener = self.root / "fake-gio"
+        opener.write_text("#!/usr/bin/python3\n" + body)
+        opener.chmod(0o755)
+        path = self.image("red.png", "red")
+        self.window.show_after_preview(path)
+        heartbeat = []
+        QTimer.singleShot(0, lambda: heartbeat.append(bool(self.window.viewer_launches)))
+        with patch("ditherpal.shutil.which", return_value=str(opener)):
+            self.window.view_result()
+        deadline = time.monotonic() + 3
+        while self.window.viewer_launches and time.monotonic() < deadline:
+            QTest.qWait(10)
+        self.assertEqual(heartbeat, [True], "GUI must handle events while the launcher is still running")
+        self.assertFalse(self.window.viewer_launches)
+
+    def test_slow_viewer_keeps_gui_responsive(self):
+        self.run_fake_viewer("import time\ntime.sleep(0.2)\n")
+        self.assertIn("Sent to viewer", self.window.status_label.text())
+
+    def test_viewer_failure_is_reported(self):
+        with patch("ditherpal.QMessageBox.warning") as warning:
+            self.run_fake_viewer("import sys\nsys.stderr.write('No viewer available')\nsys.exit(2)\n")
+        self.assertEqual(warning.call_args.args[2], "No viewer available")
 
     def test_missing_result_disables_actions_and_is_omitted(self):
         path = self.image("deleted.png", "red")

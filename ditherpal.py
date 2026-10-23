@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QDialog, QDialogButtonBox
 )
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QDesktopServices, QPainter
-from PyQt6.QtCore import pyqtSignal, QThread, Qt, QObject, QEvent, QSettings, QUrl
+from PyQt6.QtCore import pyqtSignal, QThread, Qt, QObject, QEvent, QSettings, QUrl, QProcess, QProcessEnvironment
 import threading
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
@@ -2910,6 +2910,7 @@ class DitherApp(QMainWindow):
         self.current_image_path = None
         self.worker_thread = None
         self.current_result_path = None
+        self.viewer_launches = set()
         self.result_settings = QSettings("DitherPal", "DitherPal")
         self.recent_results = self.result_settings.value("recent_results", [], type=list)
         self.setWindowTitle("DitherPal - Floyd-Steinberg Dithering Tool")
@@ -4027,8 +4028,42 @@ class DitherApp(QMainWindow):
 
     def view_result(self):
         path = self.selected_result()
-        if path is not None and not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+        if path is None:
+            return
+        # GIO opens the default viewer without Qt's desktop activation token,
+        # which can leave GNOME's launch cursor spinning after the viewer opens.
+        opener = shutil.which("gio") if sys.platform.startswith("linux") else None
+        if opener:
+            process = QProcess(self)
+            environment = QProcessEnvironment.systemEnvironment()
+            environment.remove("DESKTOP_STARTUP_ID")
+            environment.remove("XDG_ACTIVATION_TOKEN")
+            process.setProcessEnvironment(environment)
+            self.viewer_launches.add(process)
+            process.finished.connect(
+                lambda code, status: self.viewer_launch_finished(process, path, code, status))
+            process.errorOccurred.connect(
+                lambda error: self.viewer_launch_error(process, path, error))
+            # Never wait for the launcher on the GUI thread.
+            process.start(opener, ["open", str(path)])
+        elif not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
             QMessageBox.warning(self, "Could not open viewer", "No viewer could open this file. Check your default application for this format.")
+
+    def viewer_launch_error(self, process, path, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.viewer_launch_finished(process, path, -1, QProcess.ExitStatus.CrashExit)
+
+    def viewer_launch_finished(self, process, path, code, status):
+        if process not in self.viewer_launches:
+            return
+        self.viewer_launches.remove(process)
+        if code != 0 or status != QProcess.ExitStatus.NormalExit:
+            details = bytes(process.readAllStandardError()).decode(errors="replace").strip()
+            QMessageBox.warning(self, "Could not open viewer",
+                                details[:1000] or process.errorString())
+        else:
+            self.status_label.setText(f"Sent to viewer: {path.name}")
+        process.deleteLater()
 
     def finalize_result(self):
         """Copy the selected version, preserving the working output and any favorites."""
