@@ -108,6 +108,14 @@ python ditherpal.py
 3. Set an upscale factor (e.g. 4× for sharper dithering)
 4. Click **Process** — output saves automatically alongside the source file
 
+Under **Dithered Result**, use **View** to open the selected output in your default
+image or media viewer. **Finalize** keeps a copy in `dithered/Finalized/` beside
+the working outputs; existing favorites are preserved with numbered filenames.
+**Recent** lists the latest 100 available dithers, including earlier outputs in
+the current source's `dithered/` folder. Click a version to show it in the result
+preview, then view or finalize that version. Recent outputs are remembered across
+launches. Selecting a result leaves your source image and processing settings in place.
+
 ---
 
 ## Pixel Art Mode

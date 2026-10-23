@@ -7,6 +7,7 @@ Optimized with Numba JIT compilation and multithreading for maximum performance.
 
 import sys
 import os
+import shutil
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -16,10 +17,11 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QSpinBox, QCheckBox, QFileDialog,
     QProgressBar, QGroupBox, QMessageBox, QScrollArea, QColorDialog,
-    QListWidget, QListWidgetItem, QLineEdit, QAbstractSpinBox, QAbstractSlider
+    QListWidget, QListWidgetItem, QLineEdit, QAbstractSpinBox, QAbstractSlider,
+    QDialog, QDialogButtonBox
 )
-from PyQt6.QtGui import QPixmap, QImage, QFont, QColor
-from PyQt6.QtCore import pyqtSignal, QThread, Qt, QObject, QEvent
+from PyQt6.QtGui import QPixmap, QImage, QFont, QColor, QDesktopServices, QPainter
+from PyQt6.QtCore import pyqtSignal, QThread, Qt, QObject, QEvent, QSettings, QUrl
 import threading
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
@@ -2907,6 +2909,9 @@ class DitherApp(QMainWindow):
         super().__init__()
         self.current_image_path = None
         self.worker_thread = None
+        self.current_result_path = None
+        self.result_settings = QSettings("DitherPal", "DitherPal")
+        self.recent_results = self.result_settings.value("recent_results", [], type=list)
         self.setWindowTitle("DitherPal - Floyd-Steinberg Dithering Tool")
         self.setGeometry(100, 100, 1400, 900)
         self.setStyleSheet(self.get_stylesheet())
@@ -3432,6 +3437,26 @@ class DitherApp(QMainWindow):
         self.after_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.after_preview.setScaledContents(False)
         after_layout.addWidget(self.after_preview)
+        self.result_label = QLabel("Process an image or choose a recent result")
+        self.result_label.setWordWrap(True)
+        self.result_label.setTextFormat(Qt.TextFormat.PlainText)
+        after_layout.addWidget(self.result_label)
+
+        result_actions = QHBoxLayout()
+        self.view_btn = QPushButton("View")
+        self.view_btn.setToolTip("Open the selected result in your default image or media viewer")
+        self.view_btn.clicked.connect(self.view_result)
+        self.view_btn.setEnabled(False)
+        self.finalize_btn = QPushButton("Finalize")
+        self.finalize_btn.setToolTip("Keep a copy in the result folder's Finalized subfolder")
+        self.finalize_btn.clicked.connect(self.finalize_result)
+        self.finalize_btn.setEnabled(False)
+        self.recent_btn = QPushButton("Recent")
+        self.recent_btn.setToolTip("Browse recent dithers and click one to preview it")
+        self.recent_btn.clicked.connect(self.show_recent_results)
+        for button in (self.view_btn, self.finalize_btn, self.recent_btn):
+            result_actions.addWidget(button)
+        after_layout.addLayout(result_actions)
         after_group.setLayout(after_layout)
         right_layout.addWidget(after_group)
 
@@ -3968,8 +3993,8 @@ class DitherApp(QMainWindow):
 
         # Get output dimensions
         try:
-            output_image = Image.open(output_path)
-            out_width, out_height = output_image.size
+            with Image.open(output_path) as output_image:
+                out_width, out_height = output_image.size
             self.status_label.setText(f"{message}\nOutput dimensions: {out_width}x{out_height} px")
         except:
             self.status_label.setText(message)
@@ -3977,49 +4002,170 @@ class DitherApp(QMainWindow):
         self.progress_bar.setValue(100)
         self.progress_label.setText("✓ Complete!")
         
-        # Show after preview
-        try:
-            self.show_after_preview(output_path)
-        except Exception as e:
-            self.after_preview.setText(f"Could not load result: {str(e)}")
+        # Track the completed file independently of the current input or worker.
+        self.remember_result(output_path)
+        self.show_after_preview(output_path)
         
         QMessageBox.information(self, "Success", message)
     
-    def show_after_preview(self, image_path):
-        """Display the dithered image"""
+    def remember_result(self, output_path):
+        """Persist a bounded list of successful outputs across app launches."""
+        path = str(Path(output_path).resolve())
+        self.recent_results = [path] + [p for p in self.recent_results if p != path]
+        self.recent_results = self.recent_results[:100]
+        self.result_settings.setValue("recent_results", self.recent_results)
+
+    def selected_result(self):
+        """Validate the selected file again: it may have been moved or deleted."""
+        path = Path(self.current_result_path) if self.current_result_path else None
+        if path is None or not path.is_file():
+            QMessageBox.warning(self, "Result unavailable", "This result is no longer available. Choose another from Recent.")
+            self.view_btn.setEnabled(False)
+            self.finalize_btn.setEnabled(False)
+            return None
+        return path
+
+    def view_result(self):
+        path = self.selected_result()
+        if path is not None and not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+            QMessageBox.warning(self, "Could not open viewer", "No viewer could open this file. Check your default application for this format.")
+
+    def finalize_result(self):
+        """Copy the selected version, preserving the working output and any favorites."""
+        source = self.selected_result()
+        if source is None:
+            return
+        destination = None
+        created = False
         try:
-            if str(image_path).lower().endswith(('.mp4', '.svg')):
-                # Animations PIL can't open: show the first frame the worker kept
-                image = Image.fromarray(self.worker_thread.preview_frame)
+            folder = source.parent / "Finalized"
+            folder.mkdir(exist_ok=True)
+            # Exclusive creation also prevents overwrites by another running instance.
+            while True:
+                destination = self.get_unique_output_path(folder / source.name)
+                try:
+                    target = destination.open("xb")
+                    created = True
+                    break
+                except FileExistsError:
+                    continue
+            with target, source.open("rb") as original:
+                shutil.copyfileobj(original, target)
+            shutil.copystat(source, destination)
+            self.status_label.setText(f"Finalized copy saved to:\n{destination}")
+        except OSError as error:
+            if created:
+                try:
+                    destination.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            QMessageBox.warning(self, "Could not finalize result", str(error))
+
+    def recent_result_paths(self):
+        """Include earlier outputs in the current source's dithered folder, too."""
+        paths = set(self.recent_results)
+        folder = (Path(self.current_image_path).parent if self.current_image_path else Path.cwd()) / "dithered"
+        extensions = {pattern[1:] for pattern in SUPPORTED_FORMATS + VIDEO_FORMATS}
+        try:
+            paths.update(str(p.resolve()) for p in folder.iterdir()
+                         if p.is_file() and p.suffix.lower() in extensions)
+        except OSError:
+            pass
+        existing = []
+        for path in paths:
+            try:
+                file = Path(path)
+                if file.is_file():
+                    existing.append((file.stat().st_mtime, file))
+            except OSError:
+                continue
+        return [path for _, path in sorted(existing, key=lambda item: item[0], reverse=True)[:100]]
+
+    def show_recent_results(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Recent dithers")
+        dialog.resize(650, 450)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Click a version to show it in Dithered Result."))
+        results = QListWidget()
+        for path in self.recent_result_paths():
+            try:
+                modified = datetime.fromtimestamp(path.stat().st_mtime).strftime("%b %d, %Y %H:%M")
+            except OSError:
+                continue
+            item = QListWidgetItem(f"{path.name}\n{modified}  ·  {path.parent}")
+            item.setData(Qt.ItemDataRole.UserRole, str(path))
+            item.setToolTip(str(path))
+            results.addItem(item)
+            if str(path) == self.current_result_path:
+                results.setCurrentItem(item)
+        if results.count() == 0:
+            layout.addWidget(QLabel("No recent dithers yet. Process an image to create one."))
+        # Keep this window modeless so View and Finalize remain available while browsing.
+        results.currentItemChanged.connect(
+            lambda item, previous: self.select_recent_result(item) if item else None)
+        layout.addWidget(results)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(dialog.close)
+        layout.addWidget(buttons)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.show()
+
+    def select_recent_result(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        self.show_after_preview(path)
+        self.status_label.setText(f"Selected result:\n{path}")
+
+    def show_after_preview(self, image_path):
+        """Load the selected file itself, including previous video/SVG outputs."""
+        path = Path(image_path).resolve()
+        self.current_result_path = str(path)
+        available = path.is_file()
+        self.view_btn.setEnabled(available)
+        self.finalize_btn.setEnabled(available)
+        self.result_label.setText(path.name)
+        self.result_label.setToolTip(str(path))
+        try:
+            if not available:
+                raise FileNotFoundError("This result has been moved or deleted")
+            if path.suffix.lower() == '.svg':
+                from PyQt6.QtSvg import QSvgRenderer
+                renderer = QSvgRenderer(str(path))
+                if not renderer.isValid():
+                    raise ValueError("Could not read SVG")
+                size = renderer.defaultSize().scaled(300, 250, Qt.AspectRatioMode.KeepAspectRatio)
+                pixmap = QPixmap(size)
+                pixmap.fill(Qt.GlobalColor.transparent)
+                painter = QPainter(pixmap)
+                try:
+                    renderer.render(painter)
+                finally:
+                    painter.end()
             else:
-                image = Image.open(image_path)
-            
-            # Handle different image modes
-            if image.mode in ['P', 'L']:
-                # Palette or grayscale mode - convert to RGB for display
-                image = image.convert('RGB')
-            elif image.mode not in ['RGB', 'RGBA']:
-                # Other modes - convert to RGB
-                image = image.convert('RGB')
-            
-            # Scale to fit
-            image.thumbnail((300, 250), Image.Resampling.LANCZOS)
-            
-            # Convert to QPixmap
-            if image.mode == 'RGBA':
+                if path.suffix.lower() in {p[1:] for p in VIDEO_FORMATS}:
+                    import cv2
+                    capture = cv2.VideoCapture(str(path))
+                    try:
+                        success, frame = capture.read()
+                        if not success:
+                            raise ValueError("Could not read the first video frame")
+                        image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                    finally:
+                        capture.release()
+                else:
+                    with Image.open(path) as original:
+                        original.thumbnail((300, 250), Image.Resampling.LANCZOS)
+                        image = original.convert('RGBA')
+                image.thumbnail((300, 250), Image.Resampling.LANCZOS)
+                image = image.convert('RGBA')
                 data = image.tobytes()
                 q_image = QImage(data, image.width, image.height,
-                               4 * image.width, QImage.Format.Format_RGBA8888)
-            else:
-                data = image.tobytes()
-                q_image = QImage(data, image.width, image.height,
-                               3 * image.width, QImage.Format.Format_RGB888)
-            
-            pixmap = QPixmap.fromImage(q_image)
+                                 4 * image.width, QImage.Format.Format_RGBA8888)
+                pixmap = QPixmap.fromImage(q_image)
             self.after_preview.setPixmap(pixmap)
-        except Exception as e:
-            self.after_preview.setText(f"Error loading preview: {str(e)}")
-    
+        except Exception as error:
+            self.after_preview.setText(f"Error loading preview: {error}")
+
     def on_error(self, error_message):
         """Handle dithering error"""
         self.process_btn.setEnabled(True)
