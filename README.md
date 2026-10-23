@@ -113,7 +113,7 @@ python ditherpal.py
 ## Pixel Art Mode
 
 1. Open an image and pick a **Pixel Art Mode** (under *Select Image or Video*):
-   - **High Res** — detailed pixel art in the style of Mark Ferrari's *Living Worlds* scenes: fine dithering between close shades on smooth gradients and in the distance, crisp flat color up close
+   - **High Res** — detailed pixel art in the style of Mark Ferrari's *Living Worlds* scenes: fine dithering between close shades on smooth gradients and in the distance, crisp flat color up close, and a texture map that brings out shingles, leaves and stone with clumpy dither that follows the photo's own detail
    - **Retro** — Gen 3 (Ruby/Sapphire/Emerald) Pokémon sprite style: flat shade bands with thin checkered seams where neighboring shades meet, wider seams on nearby objects
 2. **Raise the Upscale Factor to 4× (or more)** — see below
 3. Click **Process**
@@ -122,6 +122,13 @@ Both modes turn on **Cel Shading** automatically (it's required — every art pi
 estimated from the picture decides where the dithering goes, and **Pattern Strength** sets how much (0% = flat cel shading).
 The dithering rules were measured from real pixel art: 11 *Living Worlds* scenes (about 22% of pixels dithered,
 always between close shades, densest far away) and 145 Emerald sprites (thin 1–2 px seams between neighboring shades only).
+
+**3D Zoom Animation** (still images, any dither method): pick **Animated GIF**, **MP4 video** or **Animated SVG** and
+the picture becomes a 4-second loop that zooms in and back out in 3D. A sharp depth map (objects walled off from the
+frame come forward, edges follow the photo) makes near things push in more than far ones; the photo is warped first and
+every frame is then dithered with the chosen method and the first frame's palette, so colors don't flicker. In Pixel Art
+Mode the SVG is drawn as vector art pixels; for other methods it is a flipbook of crisp PNG frames. Ordered dithers
+(Bayer, rosette, pixel art) stay steady in motion; error diffusion (Floyd-Steinberg, Jarvis) shimmers as dots reshuffle.
 
 > [!IMPORTANT]
 > ### 🔍 Play with the Upscale Factor — it's the secret to great pixel art

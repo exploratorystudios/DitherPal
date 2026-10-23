@@ -16,10 +16,10 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QComboBox, QSpinBox, QCheckBox, QFileDialog,
     QProgressBar, QGroupBox, QMessageBox, QScrollArea, QColorDialog,
-    QListWidget, QListWidgetItem, QLineEdit
+    QListWidget, QListWidgetItem, QLineEdit, QAbstractSpinBox, QAbstractSlider
 )
 from PyQt6.QtGui import QPixmap, QImage, QFont, QColor
-from PyQt6.QtCore import pyqtSignal, QThread, Qt
+from PyQt6.QtCore import pyqtSignal, QThread, Qt, QObject, QEvent
 import threading
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
@@ -213,33 +213,21 @@ def suggest_pixel_art_settings(rgb_array, width, height, target_cells=140):
     Tuned from a hand-picked result (2x upscale, 85% pattern strength, 8-color RGB palette),
     with the block size scaled so the art-pixel grid has about target_cells on the short side.
     rgb_array can be a thumbnail; width/height are the full image size."""
-    pixels = rgb_array.astype(np.float32)
-
-    # Hasler-Susstrunk colorfulness: near zero for grayscale art, 40+ for colorful photos
-    rg = pixels[..., 0] - pixels[..., 1]
-    yb = 0.5 * (pixels[..., 0] + pixels[..., 1]) - pixels[..., 2]
-    colorfulness = np.hypot(rg.std(), yb.std()) + 0.3 * np.hypot(rg.mean(), yb.mean())
-
     # Size art pixels so the grid has about target_cells on the short side
     source_px_per_cell = max(2, round(min(width, height) / target_cells))
 
     # 2x upscale gives each art pixel a finer checker texture; skip it for huge images
     upsample = 2 if max(width, height) * 2 <= 6000 else 1
 
-    if colorfulness < 15:
-        # Grayscale source: the RGB palette would add rainbow fringes, use gray levels instead
-        color_mode, levels = "Black & White", 4
-    else:
-        color_mode, levels = "Full Color Spectrum", 2
-
+    # Always Full Color Spectrum: cel shading builds its palette from the image's own colors,
+    # so grayscale art still comes out in gray bands
     return {
         "upsample": upsample,
         "block_size": source_px_per_cell * upsample,
         "strength": 85,
-        "color_mode": color_mode,
-        "levels": levels,
+        "color_mode": "Full Color Spectrum",
+        "levels": 2,
         "grid": (max(1, width // source_px_per_cell), max(1, height // source_px_per_cell)),
-        "colorfulness": colorfulness,
     }
 
 def find_nearest_color(pixel, palette):
@@ -1152,50 +1140,109 @@ def _blow_up(palette, labels, block, height, width):
     return np.ascontiguousarray(result.repeat(block, axis=0).repeat(block, axis=1)[:height, :width])
 
 
-def high_res_pixel_dither(image, art, block, depth, strength=0.85, ramp_steps=2.5, seed=7):
-    """High Res Pixel Art Mode: depth-mapped dither in the style of Mark Ferrari's Living Worlds.
+def fill_ramps(palette, lab, max_gap, max_bridge):
+    """Add in-between shades where two related palette colors are too far apart to dither
+    between (Ferrari's palettes give every material a ramp of close shades). Each color and its
+    nearest neighbor, if closer than max_bridge, get evenly spaced midpoints so no step is wider
+    than max_gap. lab is Lab (or lightness only, Kx1, for grayscale).
+    Returns (palette, lab) with the extra shades appended."""
+    import cv2
+
+    distance = np.sqrt(((lab[:, None] - lab[None]) ** 2).sum(axis=2)) + np.eye(len(lab)) * 1e9
+    extra = []
+    seen = set()
+    for a in range(len(lab)):
+        b = int(distance[a].argmin())
+        pair = (min(a, b), max(a, b))
+        if pair in seen or not (max_gap < distance[a, b] <= max_bridge):
+            continue
+        seen.add(pair)
+        steps = int(np.ceil(distance[a, b] / max_gap))
+        for k in range(1, steps):
+            extra.append(lab[a] + (lab[b] - lab[a]) * k / steps)
+    if not extra:
+        return palette, lab
+    extra = np.array(extra, dtype=np.float32)
+    if lab.shape[1] == 3:
+        colors = cv2.cvtColor(np.clip(extra, 0, 255).astype(np.uint8)[None], cv2.COLOR_LAB2RGB)[0]
+    else:
+        colors = np.clip(np.round(extra), 0, 255)
+    return np.concatenate([palette, colors.astype(palette.dtype)]), np.concatenate([lab, extra])
+
+
+def high_res_pixel_dither(image, art, block, depth, strength=0.85, extend_palette=True,
+                          ramp_steps=2.5, seed=7):
+    """High Res Pixel Art Mode: depth- and texture-mapped dither in the style of Mark Ferrari's
+    Living Worlds.
 
     Measured on 11 of his scenes (1.5M art pixels): ~22% of pixels sit in dither patterns, always
     between CLOSE shades (median lightness gap 7), 42% of two-color patches are clean ordered Bayer
     mixes at every ratio and the rest are hand-broken clumps, and dithering is densest far away
     (0.15 -> 0.06 far to near) and on smooth gradients. So, on whole art pixels of the cel art:
+      - every material gets a ramp of close shades (in-between shades are added where the cel
+        palette leaves big gaps, unless the palette is fixed)
       - ordered dither of the original's per-cell color between each cel shade and its ramp
-        neighbors (4x4 Bayer threshold, any mix ratio)
-      - low-frequency noise on the threshold breaks the pattern into hand-like clumps
+        neighbors (4x4 Bayer threshold, any mix ratio); low-frequency noise on the threshold
+        breaks the pattern into hand-like clumps
       - the amount grows with distance and on smooth gradients, and fades across hard edges
+      - a texture map (detail inside each art pixel: shingles, leaves, stone) overrides the edge
+        fade and pushes textured art pixels lighter/darker following the photo's own fine detail,
+        normalized locally so faint textures still read
     image is the HxWxC source, art its solid-color cel-shaded version, depth from estimate_depth."""
     import cv2
 
     height, width, channels = art.shape
     palette, labels, lab, distance, step = _art_pixel_grid(art, block)
     grid_h, grid_w = labels.shape
+    if extend_palette:
+        palette, lab = fill_ramps(palette, lab, step * 1.2, step * 4.0)
+        distance = np.sqrt(((lab[:, None] - lab[None]) ** 2).sum(axis=2))
     ramp = distance <= step * ramp_steps
 
     src = np.clip(image, 0, 255).astype(np.uint8)
-    if channels == 1:
-        src = np.ascontiguousarray(src[..., 0])  # cv2.resize drops a single channel anyway
-    small = cv2.resize(src, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
     if channels == 3:
+        lightness = cv2.cvtColor(src, cv2.COLOR_RGB2LAB)[..., 0].astype(np.float32)
+        small = cv2.resize(src, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
         cells = cv2.cvtColor(small, cv2.COLOR_RGB2LAB).astype(np.float32)
     else:
-        cells = small.astype(np.float32).reshape(grid_h, grid_w, 1)
+        lightness = src[..., 0].astype(np.float32)
+        cells = cv2.resize(lightness, (grid_w, grid_h), interpolation=cv2.INTER_AREA).reshape(grid_h, grid_w, 1)
+
+    # Texture map: spread of lightness inside each art pixel. Edges only touch a thin line of
+    # cells (removed by the median), while shingles, foliage and stone fill whole areas
+    mean = cv2.resize(lightness, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
+    mean_sq = cv2.resize(lightness * lightness, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
+    inner = cv2.medianBlur(np.sqrt(np.maximum(mean_sq - mean * mean, 0)).astype(np.float32), 3)
+    texture = np.clip((inner - 0.8) / 2.2, 0, 1)
 
     near = cv2.resize(depth, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
     slope_y, slope_x = np.gradient(cv2.GaussianBlur(cells[..., 0], (0, 0), 1.0))
-    smooth_gate = np.clip((24.0 - np.hypot(slope_x, slope_y)) / 12.0, 0.0, 1.0)
-    amount = strength * (0.35 + 0.65 * (1.0 - near)) * smooth_gate
+    smooth_gate = np.maximum(np.clip((24.0 - np.hypot(slope_x, slope_y)) / 12.0, 0.0, 1.0), texture)
+    amount = strength * np.clip((0.35 + 0.65 * (1.0 - near)) * smooth_gate + 0.5 * texture, 0, 1)
 
     rows, cols = np.mgrid[0:grid_h, 0:grid_w]
     bayer = (np.array([[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
                       dtype=np.float32) + 0.5) / 16 - 0.5
-    # Fixed seed keeps the clumps still from one video frame to the next
-    noise = cv2.GaussianBlur(np.random.default_rng(seed).standard_normal((grid_h, grid_w)).astype(np.float32),
-                             (0, 0), 1.2)
+    # Fixed seed keeps the clumps and grain still from one video frame to the next
+    rng = np.random.default_rng(seed)
+    noise = cv2.GaussianBlur(rng.standard_normal((grid_h, grid_w)).astype(np.float32), (0, 0), 1.2)
     noise /= noise.std() + 1e-6
-    threshold = 0.7 * bayer[rows % 4, cols % 4] + 0.3 * noise * 0.29
+    grain = rng.standard_normal((grid_h, grid_w)).astype(np.float32)
+    # Smooth areas: mostly ordered Bayer; textured areas: clumps and grain, like Ferrari's rock and foliage
+    ordered = 0.7 * bayer[rows % 4, cols % 4] + 0.3 * noise * 0.29
+    clumpy = 0.5 * noise * 0.29 + 0.5 * grain * 0.29
+    threshold = (1.0 - texture) * ordered + texture * clumpy
 
     probe = lab[labels] + amount[..., None] * (cells - lab[labels])
     probe[..., 0] += threshold * step * 2.0 * amount
+    # Texture mapping: follow the photo's own fine detail (shingle rows, leaf veins), normalized
+    # by the local detail level, strongly enough to cross into the neighboring shade
+    # (tuned at the default 85% pattern strength; 0% leaves flat cel shading)
+    high_pass = cells[..., 0] - cv2.GaussianBlur(cells[..., 0], (0, 0), 1.0)
+    high_pass /= np.sqrt(cv2.GaussianBlur(high_pass * high_pass, (0, 0), 2.0)) + 0.5
+    texture_push = texture * np.clip(0.65 * high_pass + 0.35 * noise, -1.5, 1.5) * step * 0.7
+    probe[..., 0] += texture_push * (strength / 0.85)
+
     candidate = ((probe.reshape(-1, 1, lab.shape[1]) - lab[None]) ** 2).sum(axis=2).argmin(axis=1)
     candidate = candidate.reshape(grid_h, grid_w)
     labels = np.where(ramp[labels, candidate], candidate, labels)  # only blend into neighboring shades
@@ -1253,6 +1300,209 @@ def retro_pixel_dither(art, block, depth, strength=0.85, ramp_steps=2.5):
     return _blow_up(palette, out, block, height, width)
 
 
+# 3D zoom animation: frames, length and how far near things push in (far things move 30% of that)
+ZOOM_FRAMES = 48
+ZOOM_SECONDS = 4.0
+ZOOM_AMOUNT = 0.12
+
+
+def _box(values, radius):
+    import cv2
+    return cv2.boxFilter(values, -1, (2 * radius + 1, 2 * radius + 1), normalize=True,
+                         borderType=cv2.BORDER_REFLECT)
+
+
+def guided_filter(guide, src, radius, eps):
+    """Color guided filter (He et al. 2010): smooths src while copying the guide's edges.
+    guide HxWx3 float32 in 0..1, src HxW float32."""
+    mean_i = _box(guide, radius)
+    mean_p = _box(src, radius)
+    cov_ip = _box(guide * src[..., None], radius) - mean_i * mean_p[..., None]
+    var = np.empty(guide.shape[:2] + (3, 3), np.float32)  # 3x3 covariance of the guide per pixel
+    for a in range(3):
+        for b in range(a, 3):
+            v = _box(guide[..., a] * guide[..., b], radius) - mean_i[..., a] * mean_i[..., b]
+            var[..., a, b] = var[..., b, a] = v
+    var += np.eye(3, dtype=np.float32) * eps
+    coef = np.linalg.solve(var, cov_ip[..., None])[..., 0]
+    offset = mean_p - (coef * mean_i).sum(axis=2)
+    return (_box(coef, radius) * guide).sum(axis=2) + _box(offset, radius)
+
+
+def figure_ground(flat, cells=40, detail=None):
+    """Foreground likelihood 0..1 from boundary connectivity (Zhu et al. 2014): a background
+    region hugs the picture frame along much of its outline, an object touches it at most at a
+    few points (ears, feet) relative to its size. Regions are soft: each grid cell's region is
+    every cell it reaches without crossing a color edge (geodesic distance on the texture-free
+    image). The bottom edge doesn't count as frame - the ground in front touches it.
+    detail (HxW, e.g. edge strength of the unflattened photo) vetoes regions far smoother than
+    the picture's typical spot when the frame itself is smooth (open sky): a sunset glow walled
+    off from the frame by darker sky is still sky, while real objects carry windows, bricks or
+    outlines. Against a busy frame (leaves) a flat cartoon is the object, so the veto fades out."""
+    import cv2
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import dijkstra
+
+    height, width = flat.shape[:2]
+    scale = cells / max(height, width)
+    gw, gh = max(2, round(width * scale)), max(2, round(height * scale))
+    lab = cv2.cvtColor(cv2.resize(flat, (gw, gh), interpolation=cv2.INTER_AREA),
+                       cv2.COLOR_RGB2LAB).astype(np.float32)
+    index = np.arange(gh * gw).reshape(gh, gw)
+    src, dst, cost = [], [], []
+    for a, b, da, db in ((index[:, :-1], index[:, 1:], lab[:, :-1], lab[:, 1:]),
+                         (index[:-1], index[1:], lab[:-1], lab[1:])):
+        step = np.maximum(np.sqrt(((da - db) ** 2).sum(axis=2)) - 6.0, 0) + 1e-3
+        src += [a.ravel(), b.ravel()]
+        dst += [b.ravel(), a.ravel()]
+        cost += [step.ravel(), step.ravel()]
+    graph = coo_matrix((np.concatenate(cost), (np.concatenate(src), np.concatenate(dst))),
+                       shape=(gh * gw, gh * gw)).tocsr()
+    span = np.exp(-dijkstra(graph) ** 2 / (2 * 20.0 ** 2))  # soft "same region" weight
+    frame = np.zeros((gh, gw), bool)
+    frame[0], frame[:, 0], frame[:, -1] = True, True, True
+    area = span.sum(axis=1)
+    connectivity = span[:, frame.ravel()].sum(axis=1) / np.sqrt(area)
+    foreground = (span @ np.exp(-connectivity ** 2 / 2.0)) / area  # each cell gets its region's verdict
+    if detail is not None:
+        cell_detail = cv2.resize(detail.astype(np.float32), (gw, gh), interpolation=cv2.INTER_AREA).ravel()
+        typical = np.median(cell_detail) + 1e-6
+        sky = np.clip(2.0 * (1.0 - np.median(cell_detail[frame.ravel()]) / typical), 0, 1)
+        smooth = 1.0 - np.clip((span @ cell_detail) / area / typical, 0, 1) ** 2
+        foreground *= 1.0 - sky * smooth
+    foreground = foreground.reshape(gh, gw)
+    foreground = (foreground - foreground.min()) / (np.ptp(foreground) + 1e-6)
+    return cv2.resize(foreground.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def estimate_depth_sharp(image, work=768):
+    """Depth map (1 = near) with crisp object edges, for the 3D zoom. The blurry layout from
+    estimate_depth keeps far/near, objects walled off from the frame (figure_ground) pop forward,
+    and an edge-aware filter guided by a texture-free version of the photo spreads the result
+    evenly across each object. image HxWxC (C = 3 or 1); returns HxW float32 0..1."""
+    import cv2
+
+    src = np.clip(image, 0, 255).astype(np.uint8)
+    if src.ndim == 2:
+        src = src[..., None]
+    if src.shape[2] == 1:
+        src = np.repeat(src, 3, axis=2)
+    height, width = src.shape[:2]
+    scale = work / max(height, width)
+    size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    small = cv2.resize(src, size, interpolation=cv2.INTER_AREA)
+    longest = max(small.shape[:2])
+
+    coarse = cv2.resize(estimate_depth(small), size, interpolation=cv2.INTER_LINEAR).astype(np.float32)
+    # Guide without texture: object colors stay, shingles/leaves/fur detail is flattened
+    flat = cv2.pyrMeanShiftFiltering(small, sp=max(4, longest // 64), sr=24, maxLevel=1)
+    guide = flat.astype(np.float32) / 255.0
+    gray = cv2.cvtColor(small, cv2.COLOR_RGB2GRAY).astype(np.float32)
+    detail = np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0)) + np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1))
+    figure = figure_ground(flat, detail=detail)
+    depth = np.maximum(0.7 * coarse, 0.3 + 0.7 * figure * (figure > 0.5))
+    # Spread along objects: big radius first (whole objects), then smaller to settle the edges
+    for radius, eps in ((longest // 12, 1e-3), (longest // 30, 3e-4), (longest // 80, 1e-4)):
+        depth = guided_filter(guide, depth.astype(np.float32), max(1, radius), eps)
+    low, high = np.percentile(depth, 2), np.percentile(depth, 98)
+    depth = np.clip((depth - low) / max(high - low, 1e-6), 0, 1)
+    return cv2.resize(depth.astype(np.float32), (width, height), interpolation=cv2.INTER_LINEAR)
+
+
+def zoom_frame(image, depth, amount):
+    """3D push-in of the photo: everything scales up around the center by 1 + amount * weight,
+    near things (weight 1) more than far ones (weight 0.3). Backward mapping - each output pixel
+    looks up where it came from - so no holes open up. The lookup starts from the nearest
+    surface and settles in a few rounds, so where things overlap the near one wins.
+    The motion follows a softened depth: a hard depth step would fold the map over itself and
+    tear or double object edges, and blurring by 1/40 of the picture keeps every lookup in order
+    at any zoom up to ~0.3 (the steepest blurred slope times the reach from center stays < 1).
+    Returns (frame, depth seen in the frame)."""
+    import cv2
+
+    height, width = depth.shape
+    cy, cx = (height - 1) / 2, (width - 1) / 2
+    ys, xs = np.mgrid[0:height, 0:width].astype(np.float32)
+    motion = cv2.GaussianBlur(depth.astype(np.float32), (0, 0), max(height, width) / 40,
+                              borderType=cv2.BORDER_REPLICATE)
+    weight = np.ones_like(motion)
+    for _ in range(4):
+        scale = 1.0 + amount * (0.3 + 0.7 * weight)
+        src_x = (cx + (xs - cx) / scale).astype(np.float32)
+        src_y = (cy + (ys - cy) / scale).astype(np.float32)
+        weight = cv2.remap(motion, src_x, src_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    weight = cv2.remap(depth.astype(np.float32), src_x, src_y, cv2.INTER_NEAREST,
+                       borderMode=cv2.BORDER_REPLICATE)
+    frame = cv2.remap(np.ascontiguousarray(image, dtype=np.float32), src_x, src_y, cv2.INTER_LINEAR,
+                      borderMode=cv2.BORDER_REPLICATE)
+    if frame.ndim == 2:
+        frame = frame[..., None]
+    return frame, weight
+
+
+def _frame_visibility(i, count, seconds):
+    """SMIL animation showing flipbook frame i (of count) only during its slice of the loop"""
+    times = f"0;{i / count:.5f};{(i + 1) / count:.5f}" if i < count - 1 else f"0;{i / count:.5f}"
+    values = "hidden;visible;hidden" if i < count - 1 else "hidden;visible"
+    return (f'<animate attributeName="visibility" values="{values}" keyTimes="{times}" '
+            f'calcMode="discrete" dur="{seconds}s" repeatCount="indefinite"/>')
+
+
+def write_zoom_svg_frames(path, pngs, width, height, seconds):
+    """Animated SVG flipbook of PNG frames (bytes), drawn with hard pixel edges at any size.
+    Used for dithers with single-pixel detail, where vector rectangles would be huge."""
+    import base64
+
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" '
+           f'width="{width}" height="{height}">']
+    for i, png in enumerate(pngs):
+        image = (f'<image href="data:image/png;base64,{base64.b64encode(png).decode()}" width="{width}" '
+                 f'height="{height}" style="image-rendering:pixelated;image-rendering:crisp-edges"/>')
+        if i == 0:
+            out.append(image)  # always underneath
+        else:
+            out.append(f'<g visibility="hidden">{_frame_visibility(i, len(pngs), seconds)}{image}</g>')
+    out.append("</svg>")
+    with open(path, "w") as f:
+        f.write("\n".join(out))
+
+
+def write_zoom_svg(path, grids, width, height, seconds):
+    """Animated SVG flipbook of art-pixel grids (each GHxGWx3 uint8): the first frame is always
+    drawn, every other frame only adds the art pixels that differ from it and is shown in turn.
+    One path of horizontal runs per color, crisp at any size, plays in any browser."""
+    grid_h, grid_w = grids[0].shape[:2]
+    count = len(grids)
+
+    def runs(grid, keep):
+        paths = {}
+        for y in range(grid_h):
+            row, mask = grid[y], keep[y]
+            x = 0
+            while x < grid_w:
+                if not mask[x]:
+                    x += 1
+                    continue
+                start = x
+                color = tuple(row[x])
+                while x < grid_w and mask[x] and tuple(row[x]) == color:
+                    x += 1
+                paths.setdefault(color, []).append(f"M{start} {y}h{x - start}v1h{start - x}z")
+        return "".join(f'<path fill="#{r:02x}{g:02x}{b:02x}" d="{"".join(d)}"/>'
+                       for (r, g, b), d in paths.items())
+
+    base = grids[0]
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {grid_w} {grid_h}" '
+           f'width="{width}" height="{height}" shape-rendering="crispEdges">',
+           f'<g>{runs(base, np.ones((grid_h, grid_w), bool))}</g>']
+    for i in range(1, count):
+        out.append(f'<g visibility="hidden">{_frame_visibility(i, count, seconds)}'
+                   f'{runs(grids[i], (grids[i] != base).any(axis=2))}</g>')
+    out.append("</svg>")
+    with open(path, "w") as f:
+        f.write("\n".join(out))
+
+
 class DitherWorker(QThread):
     """Worker thread for dithering"""
     progress = pyqtSignal(int)
@@ -1264,7 +1514,7 @@ class DitherWorker(QThread):
                  use_grayscale=False, color_mode="bw", custom_colors=None, text_pattern="",
                  restore_size=True, hybrid_strength=0.5, hybrid_cell=4, hybrid_style="grid",
                  cel_shade=False, cel_colors=24, cel_outlines=False, cel_dither=0.35,
-                 restore_upscale=False, pixel_art_style="off"):
+                 restore_upscale=False, pixel_art_style="off", zoom_format="off"):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
@@ -1286,6 +1536,12 @@ class DitherWorker(QThread):
         self.cel_outlines = cel_outlines
         self.cel_dither = cel_dither  # Grid style: checkerboard between color bands on gradients (0-1)
         self.pixel_art_style = pixel_art_style  # "off", "high_res" (Ferrari-style) or "retro" (Gen 3-style)
+        self.zoom_format = zoom_format  # 3D zoom animation of a still image: "off", "gif", "mp4" or "svg"
+        self.lock_palette = False  # Animation frames reuse the first frame's pixel art palette
+        self.locked_palette = None
+        self.locked_color_palette = None  # Full-color palette of the first animation frame
+        self.preview_frame = None
+        self.frame_depth = None  # Depth map of the current animation frame, replaces estimate_depth
         
         # Initialize dithering matrices
         self.bayer_2x2 = np.array([
@@ -1324,6 +1580,8 @@ class DitherWorker(QThread):
             if self.restore_upscale and self.upsample > 1 and not solid_pixels:
                 self.hybrid_cell = max(1, round(self.hybrid_cell / self.upsample))
                 self.upsample = 1
+            # Solid pixel art is rendered on its art-pixel grid (see _setup_pixel_art_grid)
+            self.art_block = self.hybrid_cell if solid_pixels else None
             
             # Check if it's a video file or animated GIF (process as video for MP4 output)
             video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.gif')
@@ -1335,6 +1593,9 @@ class DitherWorker(QThread):
             image = Image.open(self.input_path)
             original_size = image.size
             image = self.downscale_image(image)
+            if self.zoom_format != "off":
+                self.process_zoom_animation(image, original_size)
+                return
             self.process_static_image(image, original_size)
             
         except Exception as e:
@@ -1351,9 +1612,13 @@ class DitherWorker(QThread):
         available_memory = self._get_available_memory()
         use_chunks = estimated_memory > available_memory * 0.7
 
-        if use_chunks:
+        if self.art_block:
+            work_size = self._setup_pixel_art_grid(width, height)
+            rendered = self.apply_dithering(self._resize_to_work(image, work_size), self.method, self.levels)
+            dithered_array = self._pixel_art_to_size(rendered, self._output_size(width, height, original_size))
+        elif use_chunks:
             # Process with chunks - pass original image
-            dithered_image = self.process_with_chunks(image, self.method, self.levels, self.upsample, self.output_path)
+            dithered_array = self.process_with_chunks(image, self.method, self.levels, self.upsample, self.output_path)
         else:
             # Upscale if needed using stepped approach for memory efficiency
             if self.upsample > 1:
@@ -1465,6 +1730,207 @@ class DitherWorker(QThread):
 
         self.progress.emit(100)
         self.finished.emit(f"Successfully saved to:\n{self.output_path}", str(self.output_path))
+
+    def _output_size(self, width, height, original_size):
+        """Final result size for a (downscaled) source of width x height"""
+        if (self.downscale > 1 and self.restore_size) or (self.restore_upscale and self.upsample > 1):
+            return original_size
+        return width * self.upsample, height * self.upsample
+
+    def _setup_pixel_art_grid(self, width, height):
+        """Solid pixel art only depends on its art-pixel grid, so instead of upscaling the whole
+        picture (gigabytes for a 4x video frame) it is rendered at a few working pixels per art
+        pixel and the grid is drawn straight at the output size by _pixel_art_to_size.
+        width x height is the source after downscaling; returns the working size."""
+        up_w, up_h = width * self.upsample, height * self.upsample
+        cell = min(self.art_block, 8)
+        while cell > 2 and up_w * up_h * (cell / self.art_block) ** 2 > 30e6:
+            cell -= 1
+        self.hybrid_cell = cell  # Art-pixel size in the working image
+        self.art_size = (up_w, up_h)
+        return max(1, round(up_w * cell / self.art_block)), max(1, round(up_h * cell / self.art_block))
+
+    def _resize_to_work(self, image, work_size):
+        """Source image (PIL) to the pixel-art working size"""
+        if image.size == work_size:
+            return image
+        if work_size[0] < image.size[0]:
+            return image.resize(work_size, Image.Resampling.BOX)
+        return self.smart_resize(image, work_size)
+
+    def _pixel_art_to_size(self, rendered, out_size):
+        """Take one pixel per art pixel from a working render and draw the art-pixel grid at
+        out_size, sampling pixel centers like a nearest-neighbor resize of the upscaled result"""
+        return self._grid_to_size(rendered[::self.hybrid_cell, ::self.hybrid_cell], out_size)
+
+    def _grid_to_size(self, grid, out_size):
+        """Draw an art-pixel grid (one value per art pixel) at out_size"""
+        (up_w, up_h), (out_w, out_h) = self.art_size, out_size
+        cols = np.minimum((2 * np.arange(out_w) + 1) * up_w // (2 * out_w) // self.art_block, grid.shape[1] - 1)
+        rows = np.minimum((2 * np.arange(out_h) + 1) * up_h // (2 * out_h) // self.art_block, grid.shape[0] - 1)
+        return np.ascontiguousarray(grid[rows][:, cols])
+
+    def process_zoom_animation(self, image, original_size):
+        """3D zoom: warp the photo by its depth map (near things push in more than far ones),
+        zooming in and back out, then render every frame as pixel art with the palette locked
+        to the first frame. Saves an animated GIF, MP4 or SVG."""
+        import cv2
+
+        width, height = image.size
+        if not self.art_block:
+            self._zoom_any_dither(image.convert('RGB'), original_size)
+            return
+        work_size = self._setup_pixel_art_grid(width, height)
+        work = np.array(self._resize_to_work(image.convert('RGB'), work_size), dtype=np.float32)
+        self.status.emit("3D zoom: building the depth map...")
+        depth = estimate_depth_sharp(work)
+        self.progress.emit(10)
+
+        self.lock_palette = True
+        grids = []
+        for i in range(ZOOM_FRAMES):
+            phase = (1 - np.cos(2 * np.pi * i / ZOOM_FRAMES)) / 2  # 0 -> 1 -> 0: in, then back out
+            frame, self.frame_depth = zoom_frame(work, depth, ZOOM_AMOUNT * phase)
+            rendered = self.apply_dithering(frame, self.method, self.levels)
+            grid = rendered[::self.hybrid_cell, ::self.hybrid_cell]
+            if grid.ndim == 2:
+                grid = np.repeat(grid[..., None], 3, axis=2)
+            elif grid.shape[2] == 1:
+                grid = np.repeat(grid, 3, axis=2)
+            grids.append(np.ascontiguousarray(grid[..., :3], dtype=np.uint8))
+            self.progress.emit(10 + int(80 * (i + 1) / ZOOM_FRAMES))
+            self.status.emit(f"3D zoom: frame {i + 1}/{ZOOM_FRAMES}")
+        self.lock_palette, self.locked_palette, self.frame_depth = False, None, None
+
+        # Same size as a still result; GIF/MP4 frames are capped at 2048 px for sane file sizes
+        out_w, out_h = self._output_size(width, height, original_size)
+        output_path = str(Path(self.output_path).with_suffix('.' + self.zoom_format))
+        if self.zoom_format == "svg":
+            write_zoom_svg(output_path, grids, out_w, out_h, ZOOM_SECONDS)
+        else:
+            shrink = min(1.0, 2048 / max(out_w, out_h))
+            out_w, out_h = max(2, round(out_w * shrink)), max(2, round(out_h * shrink))
+            if self.zoom_format == "mp4":
+                out_w, out_h = out_w // 2 * 2, out_h // 2 * 2  # most players want even sizes
+            if self.zoom_format == "gif":
+                # One shared palette for every frame keeps colors exact (no GIF re-quantizing).
+                # Colors are indexed on the small art-pixel grids, then each frame is drawn
+                # full size one at a time as 1-byte palette indices
+                colors, index = np.unique(np.stack(grids).reshape(-1, 3), axis=0, return_inverse=True)
+                index = index.reshape(len(grids), *grids[0].shape[:2])
+                pictures = []
+                for i, g in enumerate(grids):
+                    if len(colors) <= 256:
+                        picture = Image.fromarray(self._grid_to_size(index[i].astype(np.uint8), (out_w, out_h)), mode='P')
+                        picture.putpalette(colors.astype(np.uint8).ravel().tolist())
+                    else:
+                        picture = Image.fromarray(self._grid_to_size(g, (out_w, out_h))).quantize(
+                            256, dither=Image.Dither.NONE)
+                    pictures.append(picture)
+                pictures[0].save(output_path, save_all=True, append_images=pictures[1:],
+                                 duration=round(1000 * ZOOM_SECONDS / ZOOM_FRAMES), loop=0)
+            else:
+                # Frames are drawn and written one at a time
+                video = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'),
+                                        ZOOM_FRAMES / ZOOM_SECONDS, (out_w, out_h))
+                for g in grids:
+                    video.write(cv2.cvtColor(self._grid_to_size(g, (out_w, out_h)), cv2.COLOR_RGB2BGR))
+                video.release()
+        self.preview_frame = grids[0]
+        self.progress.emit(100)
+        self.finished.emit(f"Saved 3D zoom animation ({ZOOM_FRAMES} frames, {ZOOM_SECONDS:g}s loop) to:\n"
+                           f"{output_path}", output_path)
+
+    def _zoom_any_dither(self, image, original_size):
+        """3D zoom for every other dither method: the photo is zoomed at its source size, each
+        frame upscaled if asked, dithered with the chosen method (palette locked to the first
+        frame) and written right away - MP4 frames go straight to the file, GIF frames are kept
+        as 1-2 byte palette indices, SVG frames as compressed PNGs."""
+        import cv2
+        import io
+
+        width, height = image.size
+        work = np.array(image, dtype=np.float32)
+        self.status.emit("3D zoom: building the depth map...")
+        depth = estimate_depth_sharp(work)
+        self.progress.emit(10)
+
+        dither_size = (width * self.upsample, height * self.upsample)
+        out_w, out_h = self._output_size(width, height, original_size)
+        output_path = str(Path(self.output_path).with_suffix('.' + self.zoom_format))
+        if self.zoom_format == "gif" and out_w * out_h * 2 * ZOOM_FRAMES > self._get_available_memory() * 0.5:
+            self.error.emit(f"A {out_w}x{out_h} GIF with {ZOOM_FRAMES} frames is too big for the free memory - "
+                            f"pick MP4 or a lower Upscale Factor.")
+            return
+        video_size = (out_w // 2 * 2, out_h // 2 * 2)  # most players want even sizes
+        video = None
+        if self.zoom_format == "mp4":
+            video = cv2.VideoWriter(output_path, cv2.VideoWriter_fourcc(*'mp4v'),
+                                    ZOOM_FRAMES / ZOOM_SECONDS, video_size)
+        colors, color_index, frames = [], {}, []
+
+        self.lock_palette = True
+        for i in range(ZOOM_FRAMES):
+            phase = (1 - np.cos(2 * np.pi * i / ZOOM_FRAMES)) / 2  # 0 -> 1 -> 0: in, then back out
+            frame, _ = zoom_frame(work, depth, ZOOM_AMOUNT * phase)
+            if self.upsample > 1:
+                frame = np.array(self.smart_resize(Image.fromarray(np.clip(frame, 0, 255).astype(np.uint8)),
+                                                   dither_size), dtype=np.float32)
+            result = np.asarray(self.apply_dithering(frame, self.method, self.levels))
+            result = np.clip(result, 0, 255).astype(np.uint8)
+            if result.ndim == 3 and result.shape[2] == 1:
+                result = result[..., 0]
+            elif result.ndim == 3 and result.shape[2] > 3:
+                result = result[..., :3]
+            if (result.shape[1], result.shape[0]) != (out_w, out_h):
+                # Pixelated result back to original size with hard pixel edges
+                result = cv2.resize(result, (out_w, out_h), interpolation=cv2.INTER_NEAREST)
+            rgb = np.repeat(result[..., None], 3, axis=2) if result.ndim == 2 else result
+
+            if video is not None:
+                video.write(cv2.cvtColor(np.ascontiguousarray(rgb[:video_size[1], :video_size[0]]),
+                                         cv2.COLOR_RGB2BGR))
+            elif self.zoom_format == "gif":
+                # Index every frame into one shared, exact palette (each color packed into one
+                # number, which sorts far faster than RGB rows)
+                packed = (rgb[..., 0].astype(np.uint32) << 16) | (rgb[..., 1].astype(np.uint32) << 8) | rgb[..., 2]
+                unique, inverse = np.unique(packed, return_inverse=True)
+                lookup = np.empty(len(unique), np.uint16)
+                for k, color in enumerate(unique.tolist()):
+                    if color not in color_index:
+                        color_index[color] = len(colors)
+                        colors.append((color >> 16, (color >> 8) & 255, color & 255))
+                    lookup[k] = color_index[color]
+                frames.append(lookup[inverse.reshape(out_h, out_w)])
+            else:
+                buffer = io.BytesIO()
+                Image.fromarray(rgb).quantize(256, dither=Image.Dither.NONE).save(buffer, 'PNG', optimize=True)
+                frames.append(buffer.getvalue())
+            if i == 0:
+                self.preview_frame = rgb
+            self.progress.emit(10 + int(85 * (i + 1) / ZOOM_FRAMES))
+            self.status.emit(f"3D zoom: frame {i + 1}/{ZOOM_FRAMES}")
+        self.lock_palette, self.locked_palette, self.locked_color_palette = False, None, None
+
+        if video is not None:
+            video.release()
+        elif self.zoom_format == "gif":
+            palette = np.array(colors, dtype=np.uint8)
+            pictures = []
+            for index in frames:
+                if len(colors) <= 256:
+                    picture = Image.fromarray(index.astype(np.uint8), mode='P')
+                    picture.putpalette(palette.ravel().tolist())
+                else:
+                    picture = Image.fromarray(palette[index]).quantize(256, dither=Image.Dither.NONE)
+                pictures.append(picture)
+            pictures[0].save(output_path, save_all=True, append_images=pictures[1:],
+                             duration=round(1000 * ZOOM_SECONDS / ZOOM_FRAMES), loop=0)
+        else:
+            write_zoom_svg_frames(output_path, frames, out_w, out_h, ZOOM_SECONDS)
+        self.progress.emit(100)
+        self.finished.emit(f"Saved 3D zoom animation ({ZOOM_FRAMES} frames, {ZOOM_SECONDS:g}s loop) to:\n"
+                           f"{output_path}", output_path)
 
     def _get_available_memory(self):
         """Get available system memory in bytes"""
@@ -1857,33 +2323,43 @@ class DitherWorker(QThread):
                 cap.release()
                 return
 
-            # Process frames in batches for GPU efficiency
-            batch_size = 8  # Process 8 frames at once for GPU parallelization
+            if self.art_block:
+                work_w, work_h = self._setup_pixel_art_grid(max(1, width // self.downscale),
+                                                            max(1, height // self.downscale))
+                frame_bytes = work_w * work_h * 3 * 16 + out_width * out_height * 3 * 2
+            else:
+                frame_bytes = dither_width * dither_height * 3 * 8 + out_width * out_height * 3 * 2
+
+            # Process frames in parallel batches, as many as fit in half the free memory
+            # (an upscaled frame can take a gigabyte or more while it is dithered)
+            batch_size = int(max(1, min(8, self._get_available_memory() * 0.5 // frame_bytes)))
             frame_batch = []
             frame_count = 0
 
             while True:
                 ret, frame = cap.read()
-                if not ret:
-                    break
-
-                # Convert BGR to RGB, then downscale and/or upscale if requested
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                if self.downscale > 1:
-                    frame_rgb = cv2.resize(frame_rgb, (max(1, width // self.downscale), max(1, height // self.downscale)),
-                                           interpolation=cv2.INTER_AREA)
-                if self.upsample > 1:
-                    pil_frame = self.smart_resize(Image.fromarray(frame_rgb), (dither_width, dither_height))
-                    frame_rgb = np.array(pil_frame)
-                frame_batch.append(frame_rgb)
+                if ret:
+                    # Convert BGR to RGB, then downscale and/or upscale if requested
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    if self.downscale > 1:
+                        frame_rgb = cv2.resize(frame_rgb, (max(1, width // self.downscale), max(1, height // self.downscale)),
+                                               interpolation=cv2.INTER_AREA)
+                    if self.art_block:
+                        frame_rgb = np.array(self._resize_to_work(Image.fromarray(frame_rgb), (work_w, work_h)))
+                    elif self.upsample > 1:
+                        pil_frame = self.smart_resize(Image.fromarray(frame_rgb), (dither_width, dither_height))
+                        frame_rgb = np.array(pil_frame)
+                    frame_batch.append(frame_rgb)
                 
-                # Process batch when full or at end
-                if len(frame_batch) >= batch_size or frame_count == total_frames - 1:
+                # Process batch when full, and whatever is left at the end
+                if frame_batch and (len(frame_batch) >= batch_size or not ret):
                     # Process batch with parallel/GPU acceleration
                     dithered_batch = self.process_frame_batch(frame_batch)
                     
                     # Write processed frames
                     for dithered_frame in dithered_batch:
+                        if self.art_block:
+                            dithered_frame = self._pixel_art_to_size(dithered_frame, (out_width, out_height))
                         # Scale pixelated frame back up with hard pixel edges
                         if (dithered_frame.shape[1], dithered_frame.shape[0]) != (out_width, out_height):
                             dithered_frame = cv2.resize(dithered_frame, (out_width, out_height),
@@ -1898,6 +2374,9 @@ class DitherWorker(QThread):
                     self.status.emit(f"Processing frame {frame_count}/{total_frames} ({progress}%)")
                     
                     frame_batch = []
+                    dithered_batch = None
+                if not ret:
+                    break
             
             # Release resources
             cap.release()
@@ -2000,20 +2479,32 @@ class DitherWorker(QThread):
             # Cel-shaded pixel art: one solid color per block (art pixel) instead of a dither
             # pattern; custom palettes are used as-is, otherwise the palette comes from the image
             fixed_palette = palette if self.color_mode == "custom" else None
+            band_palette = fixed_palette if fixed_palette is not None else self.locked_palette
             if self.pixel_art_style == "off":
-                return pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors,
-                                           self.cel_dither, fixed_palette)
+                art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors,
+                                          self.cel_dither, band_palette)
+                self._lock_palette(art)
+                return art
             # Pixel art modes: flat bands first, then a depth-mapped dither drawn from real pixel
             # art laid over them on whole art pixels (pattern strength sets how much)
-            art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors, 0.0, fixed_palette)
-            depth = estimate_depth(img_array)
+            art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors, 0.0, band_palette)
+            self._lock_palette(art)
+            depth = self.frame_depth if self.frame_depth is not None else estimate_depth(img_array)
             if self.pixel_art_style == "high_res":
-                return high_res_pixel_dither(img_array, art, self.hybrid_cell, depth, self.hybrid_strength)
+                return high_res_pixel_dither(img_array, art, self.hybrid_cell, depth, self.hybrid_strength,
+                                             extend_palette=fixed_palette is None)
             return retro_pixel_dither(art, self.hybrid_cell, depth, self.hybrid_strength)
         detail = (1.0 - self.hybrid_strength) * 3.0
         return block_pattern_dither(np.ascontiguousarray(img_array, dtype=np.float32),
                                     np.ascontiguousarray(palette, dtype=np.float32),
                                     self._bayer_rank(self.hybrid_cell), np.float32(detail))
+
+    def _lock_palette(self, art):
+        """Keep the first animation frame's cel palette so colors don't flicker between frames"""
+        if self.lock_palette and self.locked_palette is None:
+            channels = art.shape[2]
+            grid = art[::self.hybrid_cell, ::self.hybrid_cell].reshape(-1, channels)
+            self.locked_palette = np.unique(grid, axis=0).astype(np.float32)
 
     def _apply_hybrid_color(self, img_array, palette):
         """Hybrid Bayer + Floyd-Steinberg against an RGB palette"""
@@ -2295,6 +2786,11 @@ class DitherWorker(QThread):
                                               for g in np.linspace(0, 255, levels) 
                                               for b in np.linspace(0, 255, levels)], dtype=np.float32)
                 palette = palette[:min(256, len(palette))]
+        if self.lock_palette:
+            # Animation: the sampled k-means palette would shift every frame and flicker
+            if self.locked_color_palette is None:
+                self.locked_color_palette = palette
+            palette = self.locked_color_palette
 
         # Apply method-specific color dithering (rosette handled early above)
         if method == "floyd-steinberg":
@@ -2387,6 +2883,21 @@ class DitherWorker(QThread):
             result = floyd_steinberg_color_numba(img_array, palette)
         
         return result
+
+
+class WheelGuard(QObject):
+    """Event filter for settings controls: an unfocused spin box, combo box or slider passes
+    the mouse wheel on to the scroll area instead of changing its value"""
+
+    def __init__(self, scroll_area, parent=None):
+        super().__init__(parent)
+        self.scroll_area = scroll_area
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.Type.Wheel and not obj.hasFocus():
+            QApplication.sendEvent(self.scroll_area.verticalScrollBar(), event)
+            return True
+        return super().eventFilter(obj, event)
 
 
 class DitherApp(QMainWindow):
@@ -2597,6 +3108,17 @@ class DitherApp(QMainWindow):
         self.pixel_grid_spin.valueChanged.connect(self.on_pixel_grid_changed)
         pixel_grid_layout.addWidget(self.pixel_grid_spin)
         image_layout.addLayout(pixel_grid_layout)
+
+        zoom_layout = QHBoxLayout()
+        self.zoom_label = QLabel("3D Zoom Animation:")
+        zoom_layout.addWidget(self.zoom_label)
+        self.zoom_combo = QComboBox()
+        self.zoom_combo.addItems(["Off", "Animated GIF", "MP4 video", "Animated SVG"])
+        self.zoom_combo.setToolTip("Still images: turns the picture into a looping 3D zoom. A depth map makes\n"
+                                   "near things push in more than far ones, then every frame is dithered\n"
+                                   "with the chosen method and the same palette")
+        zoom_layout.addWidget(self.zoom_combo, 1)
+        image_layout.addLayout(zoom_layout)
         self.pixel_grid_label.setEnabled(False)
         self.pixel_grid_spin.setEnabled(False)
         image_group.setLayout(image_layout)
@@ -2814,11 +3336,25 @@ class DitherApp(QMainWindow):
         left_layout.addWidget(output_group)
         left_layout.addStretch()
 
+        # Block size / upscale mismatch warning, pinned above the scroll area so it stays in view
+        self.pixel_warning_label = QLabel()
+        self.pixel_warning_label.setWordWrap(True)
+        self.pixel_warning_label.setStyleSheet(
+            "color: #fbbf24; background-color: rgba(251, 191, 36, 0.12); "
+            "border: 1px solid rgba(251, 191, 36, 0.5); border-radius: 6px; padding: 6px 8px;")
+        self.pixel_warning_label.hide()
+        left_panel.addWidget(self.pixel_warning_label)
+
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         settings_scroll.setWidget(settings_widget)
         left_panel.addWidget(settings_scroll, 1)
+        # The mouse wheel scrolls the panel; a setting only takes the wheel once clicked into
+        self.wheel_guard = WheelGuard(settings_scroll, self)
+        for control in settings_widget.findChildren((QAbstractSpinBox, QComboBox, QAbstractSlider)):
+            control.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+            control.installEventFilter(self.wheel_guard)
         
         # Progress with label for percentage
         progress_container = QWidget()
@@ -3088,6 +3624,10 @@ class DitherApp(QMainWindow):
         """Internal name of the selected pixel art mode: off, high_res or retro"""
         return ("off", "high_res", "retro")[self.pixel_art_combo.currentIndex()]
 
+    def get_zoom_format(self):
+        """3D zoom animation output: off, gif, mp4 or svg"""
+        return ("off", "gif", "mp4", "svg")[self.zoom_combo.currentIndex()]
+
     def on_pixel_art_toggled(self, *_):
         """Apply pixel art settings right away if an image is already loaded.
         Both pixel art modes are built on cel shading, so it is switched on and locked."""
@@ -3096,6 +3636,12 @@ class DitherApp(QMainWindow):
         self.pixel_grid_spin.setEnabled(checked)
         if checked:
             self.cel_check.setChecked(True)
+            # Fixed parts of the preset apply right away, even before an image is loaded;
+            # the grid, block size and upscale need the image and come from apply_pixel_art_settings
+            self.method_combo.setCurrentText("hybrid bayer + floyd-steinberg")
+            self.hybrid_style_combo.setCurrentIndex(0)  # Grid
+            self.hybrid_strength_spin.setValue(85)
+            self.color_mode_combo.setCurrentText("Full Color Spectrum")
         self.update_cel_controls()
         self.update_hybrid_labels()
         if checked and self.current_image_path:
@@ -3154,11 +3700,10 @@ class DitherApp(QMainWindow):
         self.upsample_spin.setValue(settings["upsample"])
         self.downscale_spin.setValue(1)
 
-        palette = "color" if settings["color_mode"] == "Full Color Spectrum" else "grayscale"
         grid_w, grid_h = settings["grid"]
         mode = "High Res" if self.get_pixel_art_style() == "high_res" else "Retro"
         self.status_label.setText(f"{mode} Pixel Art Mode: {detail_note}{grid_w}x{grid_h} pixel grid, "
-                                  f"{self.cel_colors_spin.value()} {palette} bands. "
+                                  f"{self.cel_colors_spin.value()} color bands. "
                                   f"Pattern Strength sets the dither. Raise the Upscale Factor for finer art pixels.")
 
     def update_cel_controls(self, *_):
@@ -3241,6 +3786,7 @@ class DitherApp(QMainWindow):
         downscale = self.downscale_spin.value()
         name = Path(self.current_image_path).name
 
+        self.pixel_warning_label.hide()
         if upsample == 1 and downscale == 1:
             self.image_label.setText(f"Selected: {name}\nDimensions: {width}x{height} px")
             return
@@ -3258,8 +3804,10 @@ class DitherApp(QMainWindow):
             dims_text += f"\nOutput: {width}x{height} px"
         # Shrinking back is only crisp when every art pixel covers a whole number of output pixels
         if restore_upscale and grid and self.hybrid_cell_spin.value() % upsample != 0:
-            dims_text += (f"\n⚠ Block size {self.hybrid_cell_spin.value()} px isn't a multiple of {upsample}x - "
-                          f"some art pixels will come out uneven")
+            self.pixel_warning_label.setText(
+                f"⚠ Block size {self.hybrid_cell_spin.value()} px isn't a multiple of {upsample}x - "
+                f"some art pixels will come out uneven")
+            self.pixel_warning_label.show()
         self.image_label.setText(dims_text)
     
     def get_unique_output_path(self, base_path):
@@ -3303,6 +3851,10 @@ class DitherApp(QMainWindow):
             mode_suffix = f"_custom{num_colors}c"
         
         output_filename = f"{input_path.stem}_dithered{mode_suffix}{input_path.suffix}"
+        video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v', '.gif')
+        zoom_format = "off" if input_path.suffix.lower() in video_extensions else self.get_zoom_format()
+        if zoom_format != "off":
+            output_filename = f"{input_path.stem}_zoom{mode_suffix}.{zoom_format}"
         base_output_path = dithered_dir / output_filename
         
         # Get unique path if file exists
@@ -3380,7 +3932,8 @@ class DitherApp(QMainWindow):
             self.cel_outlines_check.isChecked(),
             self.cel_dither_spin.value() / 100.0,
             self.restore_upscale_check.isChecked(),
-            self.get_pixel_art_style()
+            self.get_pixel_art_style(),
+            zoom_format
         )
         self.worker_thread.progress.connect(self.update_progress)
         self.worker_thread.finished.connect(self.on_finished)
@@ -3435,7 +3988,11 @@ class DitherApp(QMainWindow):
     def show_after_preview(self, image_path):
         """Display the dithered image"""
         try:
-            image = Image.open(image_path)
+            if str(image_path).lower().endswith(('.mp4', '.svg')):
+                # Animations PIL can't open: show the first frame the worker kept
+                image = Image.fromarray(self.worker_thread.preview_frame)
+            else:
+                image = Image.open(image_path)
             
             # Handle different image modes
             if image.mode in ['P', 'L']:
