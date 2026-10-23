@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Neural Zoom · 3D surface inspector</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #10151e; color: #eef3fa; font: 14px system-ui, sans-serif; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; touch-action: none; }
+  canvas:active { cursor: grabbing; }
+  aside { position: fixed; left: 20px; top: 20px; max-width: 340px; padding: 18px;
+    background: #141d2bed; border: 1px solid #38516c; border-radius: 12px; }
+  h1 { font-size: 20px; margin: 0 0 8px; } p { color: #abbcd0; line-height: 1.5; }
+  label { display: block; margin: 14px 0; } input[type=range] { width: 100%; }
+  button { background: #2756a4; color: white; border: 0; border-radius: 6px; padding: 9px 16px; cursor: pointer; }
+  small { display: block; color: #abbcd0; margin-top: 14px; line-height: 1.5; }
+  #error { color: #ffc078; white-space: pre-wrap; }
+</style>
+<canvas id="scene" aria-label="Interactive textured 3D surface"></canvas>
+<aside>
+  <h1>Neural Zoom</h1>
+  <p id="name"></p>
+  <button id="play">Play zoom</button> <button id="reset">Reset camera</button>
+  <label>Camera dolly <output id="distance">0.00</output><input id="dolly" type="range" min="-0.15" max="0.4" step="0.001" value="0"></label>
+  <label><input type="checkbox" id="wire"> Show triangle mesh</label>
+  <small>Drag left/right to orbit · scroll to dolly.<br>Single-photo surface in arbitrary depth units. Empty regions are unseen surfaces, not reconstructed objects.</small>
+  <small id="stats"></small><p id="error"></p>
+</aside>
+<script>
+'use strict';
+const data = __SCENE_DATA__;
+document.getElementById('name').textContent = data.name;
+const canvas = document.getElementById('scene');
+const gl = canvas.getContext('webgl2', {antialias: true});
+try {
+  if (!gl) throw new Error('This browser does not provide WebGL 2. Try a browser with hardware acceleration enabled.');
+  const vertexSource = `#version 300 es
+    in vec3 position; in vec2 texcoord; out vec2 uv;
+    uniform vec3 camera; uniform vec2 projection; uniform vec2 depthRange; uniform float yaw;
+    void main() {
+      vec3 p = position - camera;
+      float x = cos(yaw)*p.x - sin(yaw)*p.z;
+      float z = sin(yaw)*p.x + cos(yaw)*p.z;
+      gl_Position = vec4(projection.x*x, -projection.y*p.y, depthRange.x*z + depthRange.y, z);
+      uv = texcoord;
+    }`;
+  const fragmentSource = `#version 300 es
+    precision highp float; in vec2 uv; out vec4 color;
+    uniform sampler2D photo; uniform bool wire;
+    void main() { color = wire ? vec4(0.3,0.85,1.0,1.0) : texture(photo,uv); }`;
+  function shader(type, source) {
+    const s = gl.createShader(type); gl.shaderSource(s, source); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+    return s;
+  }
+  const program = gl.createProgram();
+  gl.attachShader(program, shader(gl.VERTEX_SHADER, vertexSource));
+  gl.attachShader(program, shader(gl.FRAGMENT_SHADER, fragmentSource)); gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
+  gl.useProgram(program);
+  function decode(text, Type) {
+    const binary = atob(text), bytes = new Uint8Array(binary.length);
+    for (let i=0;i<binary.length;i++) bytes[i]=binary.charCodeAt(i);
+    return new Type(bytes.buffer);
+  }
+  function attribute(name, array, size) {
+    const buffer = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER,buffer);
+    gl.bufferData(gl.ARRAY_BUFFER,array,gl.STATIC_DRAW);
+    const location=gl.getAttribLocation(program,name);
+    gl.enableVertexAttribArray(location); gl.vertexAttribPointer(location,size,gl.FLOAT,false,0,0);
+  }
+  attribute('position',decode(data.vertices,Float32Array),3);
+  attribute('texcoord',decode(data.uv,Float32Array),2);
+  const faces = decode(data.faces,Uint32Array);
+  const triangles = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,triangles);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,faces,gl.STATIC_DRAW);
+  const lines = new Uint32Array(faces.length*2);
+  for(let i=0,j=0;i<faces.length;i+=3) {
+    const a=faces[i],b=faces[i+1],c=faces[i+2];
+    for(const index of [a,b,b,c,c,a]) lines[j++]=index;
+  }
+  const edges=gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,edges);
+  gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,lines,gl.STATIC_DRAW);
+  const texture=gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D,texture);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  let ready=false;
+  const image=new Image(); image.onload=()=>{
+    gl.bindTexture(gl.TEXTURE_2D,texture);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGB,gl.RGB,gl.UNSIGNED_BYTE,image); ready=true;canvas.dataset.ready='true';
+  };
+  image.onerror=()=>{document.getElementById('error').textContent='Could not load embedded texture';};
+  image.src=data.texture;
+  gl.enable(gl.DEPTH_TEST); gl.disable(gl.CULL_FACE);
+  const uniforms={}; for(const name of ['camera','projection','depthRange','yaw','wire']) uniforms[name]=gl.getUniformLocation(program,name);
+  const nearClip=data.near_z*0.01,farClip=data.far_z*10;
+  gl.uniform2f(uniforms.depthRange,(farClip+nearClip)/(farClip-nearClip),-2*farClip*nearClip/(farClip-nearClip));
+  const dolly=document.getElementById('dolly'), wire=document.getElementById('wire');
+  dolly.min=-0.15*data.near_z;dolly.max=0.45*data.near_z;dolly.step=0.001*data.near_z;
+  let angle=0,playing=false,started=0,lastX=null;
+  document.getElementById('stats').textContent=`${data.vertex_count.toLocaleString()} vertices · ${(faces.length/3).toLocaleString()} triangles`;
+  const play=document.getElementById('play');
+  function pause(){playing=false;play.textContent='Play zoom';}
+  play.onclick=()=>{playing=!playing;started=performance.now();play.textContent=playing?'Pause':'Play zoom';};
+  document.getElementById('reset').onclick=()=>{pause();angle=0;dolly.value=0;wire.checked=false;};
+  dolly.oninput=pause;
+  canvas.onpointerdown=event=>{pause();lastX=event.clientX;canvas.setPointerCapture(event.pointerId);};
+  canvas.onpointermove=event=>{if(lastX!==null){angle=Math.max(-0.65,Math.min(0.65,angle+(event.clientX-lastX)*0.004));lastX=event.clientX;}};
+  canvas.onpointerup=canvas.onpointercancel=()=>{lastX=null;};
+  canvas.addEventListener('wheel',event=>{event.preventDefault();pause();dolly.value=Math.max(Number(dolly.min),Math.min(Number(dolly.max),Number(dolly.value)-event.deltaY*0.0005*data.near_z));},{passive:false});
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const ratio=Math.min(devicePixelRatio||1,2),w=Math.round(canvas.clientWidth*ratio),h=Math.round(canvas.clientHeight*ratio);
+    if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h;}
+    gl.viewport(0,0,w,h);gl.clearColor(0.025,0.035,0.05,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+    if(!ready)return;
+    if(playing)dolly.value=data.dolly*(1-Math.cos((now-started)*2*Math.PI/4000))/2;
+    const distance=Number(dolly.value),radius=data.center_z-distance;
+    document.getElementById('distance').value=distance.toFixed(2);
+    gl.uniform3f(uniforms.camera,radius*Math.sin(angle),0,data.center_z-radius*Math.cos(angle));
+    gl.uniform1f(uniforms.yaw,-angle);
+    const scale=2*data.focal/data.height*Math.min(1,(w/h)/(data.width/data.height));
+    gl.uniform2f(uniforms.projection,scale/(w/h),scale);
+    gl.uniform1i(uniforms.wire,wire.checked?1:0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,wire.checked?edges:triangles);
+    gl.drawElements(wire.checked?gl.LINES:gl.TRIANGLES,wire.checked?lines.length:faces.length,gl.UNSIGNED_INT,0);
+  }
+  requestAnimationFrame(frame);
+} catch(error) {document.getElementById('error').textContent=error.message;}
+</script>
+</html>

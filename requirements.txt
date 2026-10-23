@@ -1,0 +1,8 @@
+PyQt6>=6.6,<7
+numpy>=2.2,<3
+Pillow>=10,<14
+numba>=0.63,<1
+opencv-python-headless>=4.10,<6
+onnxruntime>=1.24,<2
+scikit-learn>=1.6,<2
+psutil>=5.9,<8

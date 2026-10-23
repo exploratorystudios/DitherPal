@@ -1,5 +1,18 @@
 .venv/
 __pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+/models/
+/outputs/
+/test-neural-zoom/
+.env
+.env.*
+.aws/
+.agents/
+.codex/
+*.onnx
+*.download
 
 # Local test material and outputs
 /dithered/

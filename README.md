@@ -1,10 +1,35 @@
 # DitherPal
 
-A fast, feature-rich dithering desktop application built with PyQt6. Supports images and video with multiple dithering algorithms, full color modes, a one-click **Pixel Art Mode**, infinite upscaling, and Numba JIT acceleration.
-
----
+A PyQt6 desktop app for dithering photos and video, rendering depth-aware pixel art,
+and creating 3D camera animations from a photograph. **Neural depth is the shared
+source for every depth-aware stage**: High Res shading, Retro seams, video frames,
+and the textured 3D surface used for camera animation.
 
 ## Examples
+
+### Retro
+
+Flat color bands and checkerboard seams in a fjord landscape. Click either image
+to inspect it at full size.
+
+| Original | Retro |
+| --- | --- |
+| [![Original fjord landscape](media/comparisons/fjord.jpg)](media/comparisons/fjord.jpg) | [![Fjord rendered with Retro pixel art](media/comparisons/fjord_Retro.jpg)](media/comparisons/fjord_Retro.jpg) |
+
+Photo: [Alexey Topolyanskiy / Unsplash](https://unsplash.com/photos/-oWyJoSqBRM).
+
+### High Res
+
+Fine dithered shading across a city skyline at sunset. Click either image
+to inspect it at full size.
+
+| Original | High Res |
+| --- | --- |
+| [![Original city skyline at sunset](media/comparisons/city_skyline_sunset.jpg)](media/comparisons/city_skyline_sunset.jpg) | [![City skyline rendered with High Res pixel art](media/comparisons/city_skyline_sunset_High-Res.jpg)](media/comparisons/city_skyline_sunset_High-Res.jpg) |
+
+Photo: [Kevin Young / Unsplash](https://unsplash.com/photos/-icmOdYWXuQ).
+
+The following older examples illustrate other dither styles and predate neural depth becoming the default.
 
 ### Still Image
 
@@ -39,7 +64,7 @@ Same photo, **Pixel Art Mode + Cel Shading** — the only thing changed between 
 </table>
 
 > [!TIP]
-> **Crank up the upscale factor!** Pixel Art Mode starts you at 2×, but **4× and beyond is where it really shines** — every step up gives you finer art pixels and brings back leaves, edges and small details. See [Pixel Art Mode](#pixel-art-mode-1) below.
+> **Crank up the upscale factor!** Pixel Art Mode starts you at 2×, but **4× and beyond is where it really shines** — every step up gives you finer art pixels and brings back leaves, edges and small details. See [Pixel art](#pixel-art) below.
 
 ### Video (Click to watch)
 
@@ -64,160 +89,193 @@ Same photo, **Pixel Art Mode + Cel Shading** — the only thing changed between 
 
 ---
 
-## Features
+## Install
 
-- **Multiple dithering algorithms** — Floyd-Steinberg, Jarvis-Judice-Ninke, Hybrid Bayer + Floyd-Steinberg, Bayer (2×2, 4×4, 8×8), Ordered, Rosette Pattern, Text Pattern
-- **Pixel Art Mode** — Pick **High Res** or **Retro** and DitherPal analyzes your picture and sets everything up to turn it into pixel art
-- **Depth-mapped pixel-art dithering** — Solid-color cel-shaded art pixels plus a dither modeled on real pixel art: Mark Ferrari-style fine gradient dithering (High Res) or Gen 3 Pokémon sprite-style seams (Retro)
-- **Color modes** — Black & White, Full Color Spectrum, Custom palette
-- **Infinite upscaling** — Super-sample before dithering for ultra-sharp output at any resolution (and finer pixel art)
-- **Downscale (Pixelate)** — Dither at a fraction of the size, then scale back up with hard pixel edges
-- **Video support** — Process MP4, AVI, MOV, MKV, WebM and more; export dithered MP4 or animated GIF
-- **Numba JIT acceleration** — Compiled dithering kernels for near-native CPU performance
-- **Multithreaded video processing** — Memory-bounded batches reuse a thread pool; optional first-frame palette locking avoids repeated color fitting
-
----
-
-## Requirements
-
-```
-PyQt6
-numpy
-Pillow
-numba
-opencv-python
-scikit-learn  # optional, improves full-color palette generation
-```
-
-Install all dependencies:
+Use Python **3.12–3.14** in a virtual environment:
 
 ```bash
-pip install PyQt6 numpy Pillow numba opencv-python scikit-learn
-```
-
----
-
-## Usage
-
-```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 python ditherpal.py
 ```
 
-1. Drag and drop or open an image/video file
-2. Choose a dithering method and color mode
-3. Set an upscale factor (e.g. 4× for sharper dithering)
-4. Click **Process** — output saves automatically alongside the source file
+On Windows, activate with `.venv\Scripts\activate` instead. A graphical desktop is
+required for the app. CPU inference works without CUDA or a dedicated GPU.
+OpenCV uses its headless wheel because PyQt6 supplies the GUI. Use a fresh virtual
+environment rather than installing multiple OpenCV variants together.
 
-Under **Dithered Result**, use **View** to open the selected output in your default
-image or media viewer. **Finalize** keeps a copy in `dithered/Finalized/` beside
-the working outputs; existing favorites are preserved with numbered filenames.
-**Comparison** saves a labeled, side-by-side PNG of the original and selected
-dither in `dithered/Comparisons/`, using a unique filename each time. The dither
-keeps its full resolution; the original fits alongside it without cropping.
-For videos and animations, the comparison uses the first frame. If an older
-result has no known original, you can select it when creating the comparison.
-**Recent** lists the latest 100 available dithers, including earlier outputs in
-the current source's `dithered/` folder. Click a version to show it in the result
-preview, then view or finalize that version. Recent outputs are remembered across
-launches. Selecting a result leaves your source image and processing settings in place.
+The first depth-aware operation downloads **Depth Anything V2 Small** (about
+99 MB) into `models/`. The download is pinned and SHA-256 verified. Images are
+processed locally. Later runs reuse the weights, an in-process ONNX session, and
+cached source-image maps. Models and generated output are excluded from Git.
+There is one Python environment; the app does not depend on an experimental folder.
 
-For imported videos and GIFs, choose **Video / GIF output** in the Image panel.
-**Lock video palette to first frame** is enabled by default for steadier colors and
-less repeated work. Turn it off when later scenes introduce colors absent from the
-first frame. GIF export writes frames incrementally instead of keeping the whole
-clip in memory. GIF supports at most 256 colors per frame and centisecond timing;
-exporting as GIF does not inherently make dithering faster than MP4.
+To download the model ahead of time:
 
----
+```bash
+python -m ditherpal_depth --download-model
+```
 
-## Pixel Art Mode
+For an alternate writable model-cache directory, set `DITHERPAL_MODEL_DIR` before
+starting the app. After the first successful download, depth inference works offline.
+A model/load failure is reported explicitly; depth-aware jobs do not fall back to
+texture-based estimates. Ordinary dithering methods that do not use depth still
+work without downloading weights.
 
-1. Open an image and pick a **Pixel Art Mode** (under *Select Image or Video*):
-   - **High Res** — detailed pixel art in the style of Mark Ferrari's *Living Worlds* scenes: fine dithering between close shades on smooth gradients and in the distance, crisp flat color up close, and a texture map that brings out shingles, leaves and stone with clumpy dither that follows the photo's own detail
-   - **Retro** — Gen 3 (Ruby/Sapphire/Emerald) Pokémon sprite style: flat shade bands with thin checkered seams where neighboring shades meet, wider seams on nearby objects
-2. **Raise the Upscale Factor to 4× (or more)** — see below
-3. Click **Process**
+## Use
 
-Both modes turn on **Cel Shading** automatically (it's required — every art pixel is one solid color). A depth map
-estimated from the picture decides where the dithering goes, and **Pattern Strength** sets how much (0% = flat cel shading).
-The dithering rules were measured from real pixel art: 11 *Living Worlds* scenes (about 22% of pixels dithered,
-always between close shades, densest far away) and 145 Emerald sprites (thin 1–2 px seams between neighboring shades only).
+1. Select an image or video.
+2. Choose a dither method and color mode, or select **High Res** / **Retro** Pixel Art Mode.
+3. Adjust the art-pixel grid, block size, palette, and upscale factor as desired.
+4. Click **Process Image**. Outputs save in `dithered/` beside the source, with
+   numbered filenames when a version already exists.
 
-**3D Zoom Animation** (still images, any dither method): pick **Animated GIF**, **MP4 video** or **Animated SVG** and
-the picture becomes a 4-second loop that zooms in and back out in 3D. A sharp depth map (objects walled off from the
-frame come forward, edges follow the photo) makes near things push in more than far ones; the photo is warped first and
-every frame is then dithered with the chosen method and the first frame's palette, so colors don't flicker. In Pixel Art
-Mode the SVG is drawn as vector art pixels; for other methods it is a flipbook of crisp PNG frames. Ordered dithers
-(Bayer, rosette, pixel art) stay steady in motion; error diffusion (Floyd-Steinberg, Jarvis) shimmers as dots reshuffle.
+The settings panel scrolls; the process controls remain visible. Block-size ratio
+warnings overlay the settings and do not reserve a row or move the scroll area.
 
-> [!IMPORTANT]
-> ### 🔍 Play with the Upscale Factor — it's the secret to great pixel art
->
-> Pixel Art Mode sets the *Block Size* (how big each art pixel is) for a **2×** upscale. When you raise the
-> **Upscale Factor** and leave the block size alone, every art pixel covers **less of the original picture** —
-> so you get **more, finer art pixels** and the small details come back.
->
-> - **2×** — chunky, bold pixel art; small details get lost
-> - **4×** — ⭐ the sweet spot for most photos (the example above)
-> - **6×–8×** — even finer detail for busy pictures
->
-> **This is the only way to get the finer details**, and once you find the right factor for your picture it works
-> nearly perfectly. Try a few values — processing takes seconds.
->
-> #### 🎚️ Dial in the exact look: Upscale and Block Size work as a sliding window
->
-> The two settings pull in opposite directions:
->
-> - **Upscale Factor ↑** → closer to the original picture (more realism and detail)
-> - **Block Size ↑** → chunkier, more pixel-art-like
->
-> So you can slide between the two to land on exactly the pixel-art quality you want:
->
-> 1. **Push the Upscale Factor up** until the details you care about (faces, text, edges) come through
-> 2. **Nudge Block Size up in small steps** until it looks like pixel art again — stop when it looks right
-> 3. Too blocky? Take Block Size back a step, or raise the upscale another notch and repeat
->
-> What really matters is the ratio: an art pixel covers **Block Size ÷ Upscale** pixels of the original. 4× upscale with
-> block 16 makes the same size art pixels as 2× with block 8. The higher upscale gives you finer steps to adjust in
-> and a cleaner result. If you see the ⚠ warning at the top of the settings, pick a Block Size that's a multiple of
-> the Upscale Factor so every art pixel comes out the same size.
+### One depth control
 
-**What Pixel Art Mode sets for you:**
+Click **Depth map** to open a compact neural-depth preview. It has one slider:
 
-| Setting | What it picks |
-|---------|---------------|
-| Method | Hybrid Bayer + Floyd-Steinberg, Grid style, 85% pattern strength (the pixel-art dither amount) |
-| Art pixel grid | Measured from your picture's detail: it samples the image in regions and picks the chunkiest grid that still keeps ~89% of the detail. Busy photos get finer grids, simple cartoons chunkier ones |
-| Colors | Cel Shading on, with a palette built from your image's own colors (gray bands for grayscale/line art) |
-| Upscale | 2× to start — **raise it!** |
+- **0%:** flat depth.
+- **100%:** the model's estimated relative depth.
+- **200%:** stronger separation between near and far.
 
-All settings stay editable. **Art Pixels Across Short Side** lets you override the grid directly (lower = chunkier).
+White is near and black is far. Moving the slider updates the preview immediately
+without running the model again. The selected strength is saved and used by the
+next still-image, video, or 3D camera render. Video previews show their first frame;
+processing uses a neural map for **each** video frame. There is no depth-source
+selector, brush editor, or heuristic depth path.
 
-**Cel Shading controls** (Grid style):
+Neural depth is relative, not a measurement in metres. The model can still make
+mistakes on ambiguous scenes. The slider controls depth only; it does not change
+your palette, dither method, or color settings.
 
-| Control | What it does |
-|---------|--------------|
-| Color Bands | Size of the palette built from your image (default 24). More = more faithful colors, fewer = flatter, more stylized |
-| Shading Dither | Without a Pixel Art Mode: checkerboard shading between color bands on gradients (default 35%). 0% = perfectly flat bands. Pixel Art Modes use their own dithering instead |
+### Pixel art
 
-With a **Custom palette** color mode, cel shading uses your colors instead of building a palette.
+- **High Res:** solid cel-shaded art pixels with fine dithering between nearby
+  shades. Neural depth, texture, and gradients control where shading appears.
+- **Retro:** flat color bands with checkerboard seams between neighboring shades.
+  Neural depth controls seam placement and width.
 
----
+Both modes enable Cel Shading and start with a 2× upscale. The art-pixel grid is
+suggested from image detail and stays editable. **Pattern Strength** controls the
+amount of dithering; **Color Bands** controls the image-derived cel palette (4–64).
+Custom-palette modes preserve your chosen colors.
 
-## Dithering Methods
+Upscale and Block Size work together: an art pixel covers approximately
+**Block Size ÷ Upscale Factor** source pixels. Raising upscale while holding block
+size fixed creates finer art pixels. Increasing block size makes the result
+chunkier. With "Scale result back to original size", choose a block size divisible
+by the upscale factor for even-sized art pixels.
+
+Depth is inferred from source RGB before grayscale conversion or cel shading,
+then shared with the selected pixel-art style. Re-rendering the same unchanged
+photo with different dither settings reuses the cached map.
+
+### Neural 3D animation
+
+For a still image, choose **Animated GIF**, **MP4 video**, or **Animated SVG** under
+**Neural 3D Animation**. The app builds a textured triangle mesh from neural depth,
+then renders a perspective camera moving in and out with a Z buffer. The old
+image-warp zoom has been removed.
+
+**AI detail**, **Camera travel**, **Side motion**, and **Fill small gaps** control
+the camera render. The same depth-strength setting shapes the geometry, and its
+projected depth drives pixel-art shading in each rendered frame. Every frame uses
+your chosen dither method and a first-frame-locked palette. Animations contain
+48 frames over four seconds and have a 2048-pixel output cap. SVG output is an
+animated sequence of embedded raster frames.
+
+**3D Mesh** beneath the result opens a standalone textured viewer in your browser.
+You can orbit the geometry and show its triangles. OBJ/MTL, PLY, depth maps, raw
+peak renders, uncovered-pixel masks, and a report are saved in `dithered/neural-zoom/`.
+
+This is a single-photo visible-surface reconstruction, often called 2.5D. The
+geometry has real XYZ coordinates and occlusion, but unseen object backs and
+backgrounds remain unknown. Gap filling is a cosmetic correction, not recovered
+geometry. Small camera motions usually work best.
+
+### Video and GIF input
+
+Choose **Video / GIF output** to export imported media as MP4 or animated GIF.
+Frames are decoded in order, processed in bounded batches, and encoded
+incrementally. A reusable thread pool handles dithering. **Lock video palette to
+first frame** reduces repeated fitting and color shifts; disable it when later
+scenes introduce substantially different colors.
+
+High Res and Retro infer neural depth from each source frame before resizing and
+share that map across its shading stages. Neural inference adds CPU work to video
+processing; it does not drop frames. Non-depth-aware dither methods avoid that work.
+A single-image depth model can still exhibit temporal variation on moving scenes.
+
+GIF supports at most 256 colors per frame and centisecond timing. GIF export is
+not inherently faster than MP4. Current video exports are silent: source audio
+is not copied.
+
+### Review and keep results
+
+- **View:** open the selected result in your default image/media viewer.
+- **Finalize:** copy it into `dithered/Finalized/`, preserving existing versions.
+- **Comparison:** save a labeled original/result PNG in `dithered/Comparisons/`.
+  The dither keeps its resolution; the original fits alongside it without cropping.
+  Animations use the first frame. Older results can prompt for their original.
+- **Recent:** browse up to 100 available outputs and restore one to the result
+  viewer. The original and mesh associations are remembered across launches.
+- **3D Mesh:** inspect the selected neural camera result's geometry.
+
+Selecting a recent output leaves source-image and rendering controls in place.
+
+## Dither methods and color limits
 
 | Method | Description |
-|--------|-------------|
-| Floyd-Steinberg | Error-diffusion; smooth gradients, natural look |
-| Jarvis-Judice-Ninke | Wider error spread; finer detail retention |
-| Hybrid Bayer + Floyd-Steinberg | Error diffusion woven with a Bayer pattern. Styles: **Grid** (uniform blocks — used by Pixel Art Mode), **Hatched** (right-angle diffusion, engraving-like lines), **Woven** (Bayer-modulated crosshatch) |
-| Bayer 2×2 / 4×4 / 8×8 | Ordered threshold matrix; structured, retro feel |
-| Ordered Dither | 4×4 Bayer variant |
-| Rosette Pattern | CMYK halftone dot screening |
-| Text Pattern | Custom text tiled as a halftone mask |
+| --- | --- |
+| Floyd–Steinberg | Error diffusion |
+| Jarvis–Judice–Ninke | Wider grayscale diffusion; color currently uses Floyd–Steinberg |
+| Hybrid Bayer + Floyd–Steinberg | Grid, Hatched, and Woven styles; Grid powers Pixel Art Mode |
+| Bayer / Ordered | Ordered threshold patterns |
+| Rosette | Color-channel halftone dots |
+| Text Pattern | Custom text used as a halftone mask |
 
----
+Output Levels ranges from 2–16. In full-color palette-based paths, levels 2–6
+produce up to `levels³` RGB colors; larger settings learn an image palette capped
+at 64 colors. Bayer/Ordered/Rosette use binary channel combinations. Text Pattern
+can retain source RGB colors. Cel-shaded pixel art uses Color Bands instead; High
+Res can add intermediate ramp shades. GIF encoding limits each frame to 256 colors.
+
+## Development and GitHub
+
+```bash
+python -m pip check
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests -v
+```
+
+Tests mock neural inference where appropriate, so CI needs no GPU, model weights,
+or image upload/download. Geometry tests exercise real projection, near-surface
+occlusion, perspective-correct texture interpolation, and portable exports.
+GitHub Actions runs the suite on Python 3.12 and 3.14.
+
+Production depth code lives in `ditherpal_depth/`; `depth_editor.py` implements the
+single-slider popup. The former `test-neural-zoom/` sandbox is local-only and ignored.
+Do not add model weights, private photos, caches, virtual environments, credentials,
+or generated media to commits. Existing files under `media/` are intentional examples.
+
+To export a neural depth preview without launching the GUI:
+
+```bash
+python -m ditherpal_depth --image photo.jpg --output photo-depth.png
+```
+
+The preview is a 16-bit PNG at the cached depth-preview resolution. Choose a new
+output filename; existing files are never overwritten by this command.
+
+See [MODEL_NOTICE.md](MODEL_NOTICE.md) for model provenance and license links.
 
 ## Acknowledgements
 
-Special thanks to **[LeoBorcherding](https://github.com/LeoBorcherding)** / **[BlueberryMathematics](https://github.com/BlueberryMathematics)** for color dithering implementation and speed optimizations.
+Special thanks to **[LeoBorcherding](https://github.com/LeoBorcherding)** /
+**[BlueberryMathematics](https://github.com/BlueberryMathematics)** for color dithering
+implementation and speed optimizations. Neural depth uses
+[Depth Anything V2 Small](https://github.com/DepthAnything/Depth-Anything-V2) and its
+[ONNX Community conversion](https://huggingface.co/onnx-community/depth-anything-v2-small).
