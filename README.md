@@ -234,10 +234,25 @@ colors and soften the pixel grid. Animations contain 48 frames over four seconds
 and have a 2048-pixel output cap. SVG output is an animated sequence of embedded
 raster frames.
 
+**Fill small gaps** selects nearby background donor patches once, then attaches
+them to the scene so the same repair follows the camera throughout the animation.
+Patches keep their two-dimensional texture detail and blend into the background
+over a narrow overlap, with a 2px foreground feather at the AI detail resolution.
+Depth checks protect nearer objects from being painted over. Unmatched gaps use
+background overlap and small image fills. Turn the option off to render the raw
+surface without repairs.
+The default uses copied donor patches; it does not apply the experimental healing
+or color-matching effect. Patch selection can repeat texture or misidentify an
+ambiguous depth boundary, especially on fine details.
+
 **3D Mesh** beneath the result opens a standalone textured viewer in your browser.
 You can orbit the geometry and show its triangles. The viewer and mesh exports use
-the same baked texture as the animation. OBJ/MTL, PLY, depth maps, raw
-peak renders, uncovered-pixel masks, and a report are saved in `dithered/neural-zoom/`.
+the same baked texture as the animation and show the original visible surface.
+OBJ/MTL, PLY, depth maps, raw peak renders, uncovered-pixel masks, and a report are
+saved in `dithered/neural-zoom/`. When gap repair adds geometry, its triangle layers
+and vertex alpha are saved separately in `repair_layers.npz`, alongside the donor
+atlas and source locations. Peak repair masks identify the covered gaps and the
+foreground feather. The raw mesh viewer does not composite these animation repairs.
 
 This is a single-photo visible-surface reconstruction, often called 2.5D. The
 geometry has real XYZ coordinates and occlusion, but unseen object backs and

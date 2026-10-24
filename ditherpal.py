@@ -1772,6 +1772,9 @@ class DitherWorker(QThread):
             scene.texture = texture
             if self.isInterruptionRequested():
                 return
+            if self.neural_fill_holes:
+                self.status.emit("Neural 3D zoom: preparing background donor patches…")
+                scene.prepare_repairs(self.isInterruptionRequested, self.depth_status)
             self.mesh_viewer_path = scene.write(artifacts, Path(self.input_path).name, self.neural_dolly)
             frames = scene.frames(artifacts, ZOOM_FRAMES, self.neural_dolly, self.neural_sway,
                                   self.neural_fill_holes, self.isInterruptionRequested, output_size=output_size)
@@ -3045,7 +3048,7 @@ class DitherApp(QMainWindow):
         zoom_layout.addWidget(self.zoom_label)
         self.zoom_combo = QComboBox()
         self.zoom_combo.addItems(["Off", "Animated GIF", "MP4 video", "Animated SVG"])
-        self.zoom_combo.setToolTip("Still images: render a moving camera through neural 3D geometry, then apply your chosen dither")
+        self.zoom_combo.setToolTip("Still images: bake your chosen dither into the texture, then animate the neural 3D camera")
         zoom_layout.addWidget(self.zoom_combo, 1)
         image_layout.addLayout(zoom_layout)
         self.neural_widget = QWidget()
@@ -3074,7 +3077,7 @@ class DitherApp(QMainWindow):
         neural_layout.addLayout(motion_layout)
         self.neural_fill_check = QCheckBox("Fill small gaps revealed by camera motion")
         self.neural_fill_check.setChecked(True)
-        self.neural_fill_check.setToolTip("Cosmetic filling only: a single photo does not reveal hidden surfaces. Inspect the raw mesh with 3D Mesh.")
+        self.neural_fill_check.setToolTip("Fill seams with nearby background patches and a narrow foreground blend. Inspect the raw surface with 3D Mesh.")
         neural_layout.addWidget(self.neural_fill_check)
         image_layout.addWidget(self.neural_widget)
         self.zoom_combo.currentIndexChanged.connect(self.update_neural_controls)

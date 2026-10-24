@@ -1,4 +1,5 @@
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -231,6 +232,37 @@ class NeuralDepthTests(unittest.TestCase):
                     self.assertEqual(texture.mode, 'RGB')
                 with Image.open(output) as gif:
                     self.assertEqual(gif.n_frames, 2)
+
+    def test_camera_donor_patches_are_prepared_once_for_each_animation_format(self):
+        from ditherpal_depth.repairs import _donors
+        rgb = np.empty((48, 64, 3), np.uint8)
+        rgb[:, :32] = [240, 30, 20]
+        rgb[:, 32:] = [20, 60, 220]
+        Image.fromarray(rgb).save(self.source)
+        near = np.zeros((48, 64), np.float32)
+        near[:, :32] = 1
+        for format in ('mp4', 'gif', 'svg'):
+            with self.subTest(format=format):
+                output = self.root/f'donors.{format}'
+                worker = DitherWorker(str(self.source), str(output), 'bayer 2x2', 2, 1, 1,
+                                      color_mode='full_color', zoom_format=format)
+                errors = []
+                worker.error.connect(errors.append)
+                with patch('ditherpal.neural_depth_for_file', return_value=near):
+                    with patch('ditherpal_depth.repairs._donors', wraps=_donors) as select:
+                        with patch('ditherpal.ZOOM_FRAMES', 4):
+                            with patch.object(worker, 'apply_dithering', wraps=worker.apply_dithering) as dither:
+                                worker.run()
+                self.assertEqual(errors, [])
+                select.assert_called_once()
+                dither.assert_called_once()
+                self.assertTrue(output.is_file())
+                artifacts = Path(worker.mesh_viewer_path).parent
+                self.assertTrue((artifacts/'repair_layers.npz').is_file())
+                self.assertTrue((artifacts/'donor_texture.png').is_file())
+                report = json.loads((artifacts/'report.json').read_text())
+                self.assertGreater(report['gap_repair']['patches'], 0)
+                self.assertEqual(report['frames'], 4)
 
     def test_failed_camera_bake_resets_palette_without_creating_video(self):
         output = self.root/'failed-bake.mp4'
