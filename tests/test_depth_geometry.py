@@ -6,11 +6,13 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
+from PIL import Image
 
 from ditherpal_depth.artifacts import write_viewer
 from ditherpal_depth.model import depth_to_z, download_model, preprocess
 from ditherpal_depth.geometry import Mesh, build_mesh, write_obj, write_ply
 from ditherpal_depth.renderer import ordered_dither, rasterize, render
+from ditherpal_depth.scene import NeuralScene
 
 
 class GeometryTests(unittest.TestCase):
@@ -47,6 +49,37 @@ class GeometryTests(unittest.TestCase):
         self.assertTrue(np.all(face_depth.max(axis=1) == face_depth.min(axis=1)))
         self.assertGreater(len(mesh.faces), 0)
         self.assertLess(len(mesh.faces), 2*7*7)
+
+    def test_baked_texture_is_smoothly_rendered_and_exported_without_changing_geometry(self):
+        import base64
+        import json
+        scene = NeuralScene(Image.new('RGB', (32, 24), 'red'), np.full((24, 32), .5, np.float32))
+        vertices = scene.mesh.vertices.copy()
+        scene.texture = np.zeros((48, 64, 3), np.uint8)
+        scene.texture[:, 1::2] = 255
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            viewer = scene.write(folder, 'baked', .14)
+            with Image.open(folder/'texture.png') as texture:
+                np.testing.assert_array_equal(np.array(texture), scene.texture)
+            frames = list(scene.frames(folder, count=4, output_size=(64, 48)))
+            self.assertTrue(all(rgb.shape == (48, 64, 3) for rgb, _ in frames))
+            # A binary texture must gain intermediate shades under bilinear sampling.
+            moving = frames[1][0][4:-4, 4:-4]
+            self.assertTrue(((moving > 0) & (moving < 255)).any())
+            np.testing.assert_array_equal(scene.mesh.vertices, vertices)
+            np.testing.assert_array_equal(scene.rgb[0, 0], [255, 0, 0])
+            payload = Path(viewer).read_text().split('const data = ', 1)[1]
+            data, _ = json.JSONDecoder().raw_decode(payload)
+            with Image.open(io.BytesIO(base64.b64decode(data['texture'].split(',', 1)[1]))) as texture:
+                np.testing.assert_array_equal(np.array(texture), scene.texture)
+            ply = (folder/'scene.ply').read_bytes().split(b'end_header\n', 1)[1]
+            colors = np.frombuffer(ply, dtype=np.dtype([('xyz', '<f4', 3), ('rgb', 'u1', 3)]),
+                                   count=len(scene.mesh.vertices))['rgb']
+            self.assertTrue(((colors == 0).all(axis=1) | (colors == 255).all(axis=1)).all())
+            report = json.loads((folder/'report.json').read_text())
+            self.assertEqual(report['render_size'], [64, 48])
+            self.assertEqual(report['texture_filter'], 'bilinear')
 
     def test_exported_surface_front_faces_point_toward_source_camera(self):
         mesh = build_mesh(np.ones((8, 8), np.float32))

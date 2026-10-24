@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import QApplication, QSlider
 import ditherpal
 from ditherpal import DitherApp, DitherWorker
 from ditherpal_depth.model import image_and_depth, infer_depth, scale_depth
+from ditherpal_depth.scene import NeuralScene
 
 
 class NeuralDepthTests(unittest.TestCase):
@@ -164,32 +165,86 @@ class NeuralDepthTests(unittest.TestCase):
         for brightness, nearness in records:
             self.assertAlmostEqual(brightness, nearness, places=5)
 
-    def test_camera_uses_projected_depth_without_second_inference_or_strength(self):
+    def test_camera_bakes_once_with_source_depth_and_exports_all_formats(self):
         raw = np.full((48, 64), .8, np.float32)
         for format in ('mp4', 'gif', 'svg'):
             with self.subTest(format=format):
                 output = self.root/f'zoom.{format}'
                 worker = DitherWorker(str(self.source), str(output), 'hybrid bayer + floyd-steinberg',
-                                      2, 1, 1, color_mode='full_color', cel_shade=True, hybrid_cell=4,
+                                      2, 2, 1, color_mode='full_color', cel_shade=True, hybrid_cell=4,
                                       pixel_art_style='retro', zoom_format=format, depth_strength=0)
                 errors = []
                 worker.error.connect(errors.append)
-                frames = [(np.full((48, 64, 3), 70, np.uint8), np.full((48, 64), n, np.float32)) for n in (.2, .7)]
                 with patch('ditherpal.neural_depth_for_file', return_value=raw):
-                    with patch('ditherpal.NeuralScene') as scene:
-                        viewer = self.root/f'viewer-{format}.html'
-                        viewer.write_text('<html>mesh fixture</html>')
-                        scene.return_value.write.return_value = str(viewer)
-                        scene.return_value.frames.return_value = iter(frames)
-                        with patch('ditherpal.retro_pixel_dither', side_effect=lambda art, *args: art) as effect:
+                    with patch('ditherpal.NeuralScene', wraps=NeuralScene) as scene:
+                        def baked_color(art, *args):
+                            return np.full_like(art, [32, 160, 224])
+                        with patch('ditherpal.retro_pixel_dither', side_effect=baked_color) as effect:
                             with patch('ditherpal.ZOOM_FRAMES', 2):
                                 with patch('ditherpal.predict_near', side_effect=AssertionError('Repeated camera inference')):
                                     worker.run()
                 self.assertEqual(errors, [])
                 self.assertEqual(scene.call_args.args[2], 0)
+                np.testing.assert_array_equal(np.array(scene.call_args.args[0])[0, 0], [255, 0, 0])
                 self.assertTrue(output.is_file())
-                np.testing.assert_allclose(effect.call_args_list[0].args[2], .2)
-                np.testing.assert_allclose(effect.call_args_list[1].args[2], .7)
+                effect.assert_called_once()
+                np.testing.assert_allclose(effect.call_args.args[2], .5)
+                artifacts = Path(worker.mesh_viewer_path).parent
+                with Image.open(artifacts/'texture.png') as texture:
+                    self.assertEqual(texture.size, (128, 96))
+                    np.testing.assert_array_equal(np.array(texture)[0, 0], [32, 160, 224])
+                if format == 'mp4':
+                    cap = cv2.VideoCapture(str(output))
+                    try:
+                        self.assertEqual(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 2)
+                        ok, frame = cap.read()
+                        self.assertTrue(ok)
+                        self.assertEqual(frame.shape, (96, 128, 3))
+                        np.testing.assert_allclose(frame[48, 64], [224, 160, 32], atol=5)
+                    finally:
+                        cap.release()
+                elif format == 'gif':
+                    with Image.open(output) as gif:
+                        self.assertEqual(gif.n_frames, 2)
+                        self.assertEqual(gif.size, (128, 96))
+                        self.assertEqual(gif.convert('RGB').getpixel((64, 48)), (32, 160, 224))
+                else:
+                    self.assertEqual(output.read_text().count('data:image/png;base64,'), 2)
+
+    def test_camera_bakes_grayscale_and_custom_textures_as_rgb(self):
+        Image.new('RGB', (64, 48), (128, 128, 128)).save(self.source)
+        for color_mode in ('bw', 'full_color', 'custom'):
+            with self.subTest(color_mode=color_mode):
+                output = self.root/f'zoom-{color_mode}.gif'
+                worker = DitherWorker(str(self.source), str(output), 'bayer 2x2', 2, 1, 1,
+                                      color_mode=color_mode, custom_colors=[[0, 0, 0], [255, 255, 255]],
+                                      zoom_format='gif')
+                errors = []
+                worker.error.connect(errors.append)
+                with patch('ditherpal.neural_depth_for_file', return_value=np.full((48, 64), .5, np.float32)):
+                    with patch('ditherpal.ZOOM_FRAMES', 2):
+                        with patch.object(worker, 'apply_dithering', wraps=worker.apply_dithering) as effect:
+                            worker.run()
+                self.assertEqual(errors, [])
+                effect.assert_called_once()
+                with Image.open(Path(worker.mesh_viewer_path).parent/'texture.png') as texture:
+                    self.assertEqual(texture.mode, 'RGB')
+                with Image.open(output) as gif:
+                    self.assertEqual(gif.n_frames, 2)
+
+    def test_failed_camera_bake_resets_palette_without_creating_video(self):
+        output = self.root/'failed-bake.mp4'
+        worker = DitherWorker(str(self.source), str(output), 'bayer 2x2', 2, 1, 1, zoom_format='mp4')
+        errors = []
+        worker.error.connect(errors.append)
+        with patch('ditherpal.neural_depth_for_file', return_value=np.full((48, 64), .5, np.float32)):
+            with patch.object(worker, 'apply_dithering', side_effect=RuntimeError('Bake failed')):
+                worker.run()
+        self.assertEqual(len(errors), 1)
+        self.assertIn('Bake failed', errors[0])
+        self.assertFalse(output.exists())
+        self.assertFalse(worker.lock_palette)
+        self.assertIsNone(worker.locked_palette)
 
     def test_model_failure_is_explicit_without_fallback(self):
         worker = DitherWorker(str(self.source), str(self.root/'fail.png'), 'hybrid bayer + floyd-steinberg',

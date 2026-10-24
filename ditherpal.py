@@ -1727,7 +1727,7 @@ class DitherWorker(QThread):
         self.status.emit(message)
 
     def process_zoom_animation(self, image, original_size):
-        """Neural mesh + perspective camera for every dither method, with one depth strength."""
+        """Bake dithering once, then animate the neural mesh with smooth texture sampling."""
         import cv2
 
         width, height = image.size
@@ -1751,29 +1751,33 @@ class DitherWorker(QThread):
         artifact_root = output_path.parent/'neural-zoom'
         artifact_root.mkdir(exist_ok=True)
         artifacts = Path(tempfile.mkdtemp(prefix=output_path.stem+'-', dir=artifact_root))
-        self.mesh_viewer_path = scene.write(artifacts, Path(self.input_path).name, self.neural_dolly)
         video = gif = None
         svg_frames, count, complete = [], 0, False
         self.lock_palette = True
         self.locked_palette = self.locked_color_palette = None
         try:
+            self.status.emit("Neural 3D zoom: baking dithered texture…")
+            source = self._resize_to_work(Image.fromarray(scene.rgb), work_size)
+            texture_depth = cv2.resize(scene.near, work_size, interpolation=cv2.INTER_LINEAR)
+            texture = np.asarray(self.apply_dithering(source, self.method, self.levels, depth=texture_depth))
+            if texture.ndim == 2:
+                texture = np.repeat(texture[..., None], 3, axis=2)
+            elif texture.shape[2] == 1:
+                texture = np.repeat(texture, 3, axis=2)
+            texture = np.ascontiguousarray(texture[..., :3], dtype=np.uint8)
+            if self.art_block:
+                texture = self._pixel_art_to_size(texture, output_size)
+            elif (texture.shape[1], texture.shape[0]) != output_size:
+                texture = cv2.resize(texture, output_size, interpolation=cv2.INTER_NEAREST)
+            scene.texture = texture
+            if self.isInterruptionRequested():
+                return
+            self.mesh_viewer_path = scene.write(artifacts, Path(self.input_path).name, self.neural_dolly)
             frames = scene.frames(artifacts, ZOOM_FRAMES, self.neural_dolly, self.neural_sway,
-                                  self.neural_fill_holes, self.isInterruptionRequested)
-            for rgb, projected_depth in frames:
+                                  self.neural_fill_holes, self.isInterruptionRequested, output_size=output_size)
+            for result, _ in frames:
                 if self.isInterruptionRequested():
                     return
-                frame = self._resize_to_work(Image.fromarray(rgb), work_size)
-                near_frame = cv2.resize(projected_depth, work_size, interpolation=cv2.INTER_LINEAR)
-                result = np.asarray(self.apply_dithering(frame, self.method, self.levels, depth=near_frame))
-                if result.ndim == 2:
-                    result = np.repeat(result[..., None], 3, axis=2)
-                elif result.shape[2] == 1:
-                    result = np.repeat(result, 3, axis=2)
-                result = np.ascontiguousarray(result[..., :3], dtype=np.uint8)
-                if self.art_block:
-                    result = self._pixel_art_to_size(result, output_size)
-                elif (result.shape[1], result.shape[0]) != output_size:
-                    result = cv2.resize(result, output_size, interpolation=cv2.INTER_NEAREST)
                 if count == 0:
                     self.preview_frame = result.copy()
                     if self.zoom_format == "mp4":
@@ -1793,7 +1797,7 @@ class DitherWorker(QThread):
                     svg_frames.append(buffer.getvalue())
                 count += 1
                 self.progress.emit(10+round(85*count/ZOOM_FRAMES))
-                self.status.emit(f"Neural 3D zoom: dithering frame {count}/{ZOOM_FRAMES}")
+                self.status.emit(f"Neural 3D zoom: rendering frame {count}/{ZOOM_FRAMES}")
             if self.isInterruptionRequested():
                 return
             if count != ZOOM_FRAMES:

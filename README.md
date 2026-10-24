@@ -225,14 +225,18 @@ then renders a perspective camera moving in and out with a Z buffer. The old
 image-warp zoom has been removed.
 
 **AI detail**, **Camera travel**, **Side motion**, and **Fill small gaps** control
-the camera render. The same depth-strength setting shapes the geometry, and its
-projected depth drives pixel-art shading in each rendered frame. Every frame uses
-your chosen dither method and a first-frame-locked palette. Animations contain
-48 frames over four seconds and have a 2048-pixel output cap. SVG output is an
-animated sequence of embedded raster frames.
+the camera render. The same depth-strength setting shapes the geometry and drives
+pixel-art shading. Your chosen dither method runs once on the source image, and
+the result is baked into the mesh texture before the camera animation. Frames
+render directly at the output size with smooth bilinear texture sampling, so the
+pattern follows the surface during motion. Filtering can introduce intermediate
+colors and soften the pixel grid. Animations contain 48 frames over four seconds
+and have a 2048-pixel output cap. SVG output is an animated sequence of embedded
+raster frames.
 
 **3D Mesh** beneath the result opens a standalone textured viewer in your browser.
-You can orbit the geometry and show its triangles. OBJ/MTL, PLY, depth maps, raw
+You can orbit the geometry and show its triangles. The viewer and mesh exports use
+the same baked texture as the animation. OBJ/MTL, PLY, depth maps, raw
 peak renders, uncovered-pixel masks, and a report are saved in `dithered/neural-zoom/`.
 
 This is a single-photo visible-surface reconstruction, often called 2.5D. The
