@@ -213,6 +213,17 @@ suggested from image detail and stays editable. **Pattern Strength** controls th
 amount of dithering; **Color Bands** controls the image-derived cel palette (4–64).
 Custom-palette modes preserve your chosen colors.
 
+**Export at native pixel size** saves one image pixel per art pixel in High Res
+and Retro. It uses the renderer's exact grid, including partial edge cells,
+without averaging or introducing colors. Stills export as lossless PNGs, including
+when the source is a JPEG. The output dimensions appear beside
+the selected image. Upscaling still controls art detail; both restore-original-size
+options are overridden while this checkbox is selected. For example, a 640×480
+image rendered at 2× with 8-pixel blocks exports at 160×120.
+Video uses the same grid; MP4 pads an odd dimension with an edge pixel rather
+than stretching the grid. Neural 3D animation uses the smaller texture and canvas
+while retaining smooth camera sampling, so moving 3D surfaces can blend pixels.
+
 **Preserve bright details** (on by default) gives narrow bright features more
 weight before art-pixel averaging, keeps rare highlight shades within the chosen
 cel palette size, and prevents valid sparks from being removed as stray pixels.

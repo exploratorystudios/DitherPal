@@ -1532,7 +1532,7 @@ class DitherWorker(QThread):
                  cel_shade=False, cel_colors=24, cel_outlines=False, cel_dither=0.35,
                  restore_upscale=False, pixel_art_style="off", zoom_format="off", video_format="mp4", lock_video_palette=True,
                  neural_resolution=720, neural_dolly=.14, neural_sway=.02,
-                 neural_fill_holes=True, depth_strength=100, preserve_highlights=True):
+                 neural_fill_holes=True, depth_strength=100, preserve_highlights=True, native_pixel_size=False):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
@@ -1570,6 +1570,7 @@ class DitherWorker(QThread):
         self.preview_frame = None
         self.depth_strength = int(depth_strength)
         self.preserve_highlights = preserve_highlights
+        self.native_pixel_size = native_pixel_size
         self.source_depth = None
         
         # Initialize dithering matrices
@@ -1759,12 +1760,13 @@ class DitherWorker(QThread):
                 dithered_image = dithered_array
 
         # Scale pixelated result back to original size with hard pixel edges
-        if self.downscale > 1 and self.restore_size:
+        if self.downscale > 1 and self.restore_size and not self.exports_native_pixels():
             dithered_image = dithered_image.resize(original_size, Image.Resampling.NEAREST)
 
         # Shrink an upscaled result back to original size; nearest-neighbor keeps pure palette
         # colors, and art pixels stay crisp when the block size is a multiple of the upscale
-        if self.restore_upscale and self.upsample > 1 and dithered_image.size != original_size:
+        if (self.restore_upscale and self.upsample > 1 and not self.exports_native_pixels()
+                and dithered_image.size != original_size):
             dithered_image = dithered_image.resize(original_size, Image.Resampling.NEAREST)
 
         # Save with maximum PNG compression for optimal file size
@@ -1776,8 +1778,15 @@ class DitherWorker(QThread):
         self.progress.emit(100)
         self.finished.emit(f"Successfully saved to:\n{self.output_path}", str(self.output_path))
 
+    def exports_native_pixels(self):
+        """Only pixel-art modes have a solid art-pixel grid to export directly."""
+        return self.native_pixel_size and self.uses_depth()
+
     def _output_size(self, width, height, original_size):
         """Final result size for a (downscaled) source of width x height"""
+        if self.exports_native_pixels():
+            block = getattr(self, 'art_block', None) or self.hybrid_cell
+            return tuple((n*self.upsample+block-1)//block for n in (width, height))
         if (self.downscale > 1 and self.restore_size) or (self.restore_upscale and self.upsample > 1):
             return original_size
         return width * self.upsample, height * self.upsample
@@ -1793,6 +1802,10 @@ class DitherWorker(QThread):
             cell -= 1
         self.hybrid_cell = cell  # Art-pixel size in the working image
         self.art_size = (up_w, up_h)
+        if self.exports_native_pixels():
+            # Include partial edge cells and keep the working grid exact even for
+            # blocks above the working-cell limit (or a non-divisible image size).
+            return tuple((n+self.art_block-1)//self.art_block*cell for n in (up_w, up_h))
         return max(1, round(up_w * cell / self.art_block)), max(1, round(up_h * cell / self.art_block))
 
     def _resize_to_work(self, image, work_size):
@@ -1806,7 +1819,16 @@ class DitherWorker(QThread):
     def _pixel_art_to_size(self, rendered, out_size):
         """Take one pixel per art pixel from a working render and draw the art-pixel grid at
         out_size, sampling pixel centers like a nearest-neighbor resize of the upscaled result"""
-        return self._grid_to_size(rendered[::self.hybrid_cell, ::self.hybrid_cell], out_size)
+        grid = rendered[::self.hybrid_cell, ::self.hybrid_cell]
+        if self.exports_native_pixels():
+            return np.ascontiguousarray(grid)
+        return self._grid_to_size(grid, out_size)
+
+    @staticmethod
+    def _pad_video_frame(frame, out_size):
+        """MP4 needs even dimensions; extend the border without resampling the art."""
+        width, height = out_size
+        return np.pad(frame, ((0, height-frame.shape[0]), (0, width-frame.shape[1]), (0, 0)), mode='edge')
 
     def _grid_to_size(self, grid, out_size):
         """Draw an art-pixel grid (one value per art pixel) at out_size"""
@@ -1830,10 +1852,13 @@ class DitherWorker(QThread):
 
         width, height = image.size
         output_size = self._output_size(width, height, original_size)
-        scale = min(1., 2048/max(output_size))
-        output_size = tuple(max(2, round(n*scale)) for n in output_size)
-        if self.zoom_format == "mp4":
-            output_size = tuple(n//2*2 for n in output_size)
+        if not self.exports_native_pixels():
+            scale = min(1., 2048/max(output_size))
+            output_size = tuple(max(2, round(n*scale)) for n in output_size)
+            if self.zoom_format == "mp4":
+                output_size = tuple(n//2*2 for n in output_size)
+        encoded_size = (tuple(max(2, n+n % 2) for n in output_size)
+                        if self.zoom_format == "mp4" else output_size)
         if self.art_block:
             work_size = self._setup_pixel_art_grid(width, height)
         else:
@@ -1879,11 +1904,13 @@ class DitherWorker(QThread):
             for result, _ in frames:
                 if self.isInterruptionRequested():
                     return
+                if self.exports_native_pixels() and self.zoom_format == "mp4":
+                    result = self._pad_video_frame(result, encoded_size)
                 if count == 0:
                     self.preview_frame = result.copy()
                     if self.zoom_format == "mp4":
                         video = cv2.VideoWriter(str(output_path), cv2.VideoWriter_fourcc(*'mp4v'),
-                                                ZOOM_FRAMES/ZOOM_SECONDS, output_size)
+                                                ZOOM_FRAMES/ZOOM_SECONDS, encoded_size)
                         if not video.isOpened():
                             raise RuntimeError("Could not create the neural zoom MP4")
                     elif self.zoom_format == "gif":
@@ -2324,7 +2351,10 @@ class DitherWorker(QThread):
                         if self.art_block:
                             rendered = self._pixel_art_to_size(rendered, output_size)
                         if (rendered.shape[1], rendered.shape[0]) != output_size:
-                            rendered = cv2.resize(rendered, output_size, interpolation=cv2.INTER_NEAREST)
+                            if self.exports_native_pixels():
+                                rendered = self._pad_video_frame(rendered, output_size)
+                            else:
+                                rendered = cv2.resize(rendered, output_size, interpolation=cv2.INTER_NEAREST)
                         if self.preview_frame is None:
                             self.preview_frame = rendered.copy()
                         if self.video_format == "gif":
@@ -3141,6 +3171,12 @@ class DitherApp(QMainWindow):
         self.pixel_grid_spin.valueChanged.connect(self.on_pixel_grid_changed)
         pixel_grid_layout.addWidget(self.pixel_grid_spin)
         image_layout.addLayout(pixel_grid_layout)
+        self.native_pixel_check = QCheckBox("Export at native pixel size (1×)")
+        self.native_pixel_check.setChecked(self.result_settings.value('native_pixel_size', False, type=bool))
+        self.native_pixel_check.setToolTip("High Res and Retro: export the actual art-pixel grid without blending colors. Overrides restore-original-size options. 3D uses this smaller canvas with smooth camera sampling; MP4 may add a one-pixel border.")
+        self.native_pixel_check.toggled.connect(lambda checked: self.result_settings.setValue('native_pixel_size', checked))
+        self.native_pixel_check.toggled.connect(self.update_dimensions_text)
+        image_layout.addWidget(self.native_pixel_check)
 
         zoom_layout = QHBoxLayout()
         self.zoom_label = QLabel("Neural 3D Animation:")
@@ -3186,6 +3222,7 @@ class DitherApp(QMainWindow):
         video_layout.addWidget(QLabel("Video / GIF output:"))
         self.video_format_combo = QComboBox()
         self.video_format_combo.addItems(["MP4 video", "Animated GIF"])
+        self.video_format_combo.currentIndexChanged.connect(self.update_dimensions_text)
         self.video_format_combo.setToolTip("Applies to imported videos and GIFs. GIF output is limited to 256 colors per frame.")
         video_layout.addWidget(self.video_format_combo, 1)
         image_layout.addLayout(video_layout)
@@ -3766,6 +3803,7 @@ class DitherApp(QMainWindow):
 
     def update_neural_controls(self, *_):
         self.neural_widget.setVisible(self.get_zoom_format() != "off")
+        self.update_dimensions_text()
 
     def get_zoom_format(self):
         """3D zoom animation output: off, gif, mp4 or svg"""
@@ -3865,6 +3903,8 @@ class DitherApp(QMainWindow):
                 and self.get_hybrid_style() == "grid")
         self.cel_outlines_check.setEnabled(enabled and not grid)
         self.light_details_check.setEnabled(enabled and grid)
+        self.native_pixel_check.setEnabled(pixel_art and enabled and grid)
+        self.update_dimensions_text()
         # Pixel art modes replace the shading dither with their own depth-mapped dither
         self.cel_dither_label.setEnabled(enabled and grid and not pixel_art)
         self.cel_dither_spin.setEnabled(enabled and grid and not pixel_art)
@@ -3916,15 +3956,29 @@ class DitherApp(QMainWindow):
 
     def update_dimensions_text(self):
         """Show original and projected output dimensions for the loaded image"""
+        native_pixels = self.native_pixel_check.isEnabled() and self.native_pixel_check.isChecked()
+        for name in ('restore_size_check', 'restore_upscale_check'):
+            if hasattr(self, name):
+                getattr(self, name).setEnabled(not native_pixels)
         if not self.current_image_path:
             return
         video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
-        if self.current_image_path.lower().endswith(video_extensions):
-            return
+        is_video = self.current_image_path.lower().endswith(video_extensions + ('.gif',))
         try:
-            with Image.open(self.current_image_path) as image:
-                width, height = image.size
-        except:
+            if is_video:
+                import cv2
+                cap = cv2.VideoCapture(self.current_image_path)
+                try:
+                    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                finally:
+                    cap.release()
+                if width <= 0 or height <= 0:
+                    return
+            else:
+                with Image.open(self.current_image_path) as image:
+                    width, height = image.size
+        except Exception:
             return
 
         upsample = self.upsample_spin.value()
@@ -3932,6 +3986,18 @@ class DitherApp(QMainWindow):
         name = Path(self.current_image_path).name
 
         self.pixel_warning_label.hide()
+        if native_pixels:
+            block = self.hybrid_cell_spin.value()
+            output = tuple((max(1, n//downscale)*upsample+block-1)//block for n in (width, height))
+            dims_text = (f"Selected: {name}\nOriginal: {width}x{height} px"
+                         f"\nOutput: {output[0]}x{output[1]} px (1 pixel per art pixel)")
+            mp4 = (self.video_format_combo.currentIndex() == 0 if is_video
+                   else self.get_zoom_format() == "mp4")
+            if mp4 and any(n % 2 for n in output):
+                encoded = tuple(max(2, n+n % 2) for n in output)
+                dims_text += f"\nMP4 canvas: {encoded[0]}x{encoded[1]} px (border padded)"
+            self.image_label.setText(dims_text)
+            return
         if upsample == 1 and downscale == 1:
             self.image_label.setText(f"Selected: {name}\nDimensions: {width}x{height} px")
             return
@@ -4004,6 +4070,9 @@ class DitherApp(QMainWindow):
         if is_video:
             output_filename = f"{input_path.stem}_dithered{mode_suffix}.{video_format}"
         zoom_format = "off" if is_video else self.get_zoom_format()
+        native_pixels = self.native_pixel_check.isEnabled() and self.native_pixel_check.isChecked()
+        if native_pixels and not is_video and zoom_format == "off":
+            output_filename = f"{input_path.stem}_dithered{mode_suffix}.png"
         if zoom_format != "off":
             output_filename = f"{input_path.stem}_neural_zoom{mode_suffix}.{zoom_format}"
         base_output_path = dithered_dir / output_filename
@@ -4092,7 +4161,8 @@ class DitherApp(QMainWindow):
             neural_sway=self.neural_sway_spin.value()/100.,
             neural_fill_holes=self.neural_fill_check.isChecked(),
             depth_strength=self.depth_strength,
-            preserve_highlights=self.light_details_check.isChecked()
+            preserve_highlights=self.light_details_check.isChecked(),
+            native_pixel_size=native_pixels
         )
         self.worker_thread.progress.connect(self.update_progress)
         self.worker_thread.finished.connect(self.on_finished)
