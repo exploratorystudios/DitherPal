@@ -93,6 +93,10 @@ Photo: [Kevin Young / Unsplash](https://unsplash.com/photos/-icmOdYWXuQ).
 >
 > - **Upscale Factor ↑** → closer to the original picture, with more detail
 > - **Block Size ↑** → chunkier, more pixel-art-like
+> - **Block Size ↓** → finer art pixels, greater fidelity, and more original detail
+>
+> You can adjust Block Size in either direction: raise it for a stronger pixel-art
+> style, or lower it to recover detail while keeping the same Upscale Factor.
 >
 > To find the balance you want:
 >
@@ -108,6 +112,18 @@ Photo: [Kevin Young / Unsplash](https://unsplash.com/photos/-icmOdYWXuQ).
 > steps to adjust the ratio. With **Scale result back to original size**, choose
 > a Block Size that's a multiple of the Upscale Factor so every art pixel comes
 > out the same size; the ratio warning helps flag uneven combinations.
+>
+> #### Adjust depth to guide the visual focus
+>
+> Open **Depth map** and adjust its strength slider while tuning the pixel-art look:
+>
+> - **Move left (lower strength)** to help background detail come into focus.
+> - **Move right (higher strength)** to put more visual emphasis on the foreground.
+>
+> **About 20%–100%** is a useful range for most images. Try **above 100%** when a
+> subject is particularly close to the camera and needs stronger foreground
+> emphasis. These adjustments control the depth-driven pixel-art shading; compare
+> renders to find the balance that suits your image.
 
 **What Pixel Art Mode sets for you:**
 
