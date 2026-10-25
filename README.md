@@ -277,14 +277,17 @@ raster frames.
 
 **Fill small gaps** selects nearby background donor patches once, then attaches
 them to the scene so the same repair follows the camera throughout the animation.
-Patches keep their two-dimensional texture detail and blend into the background
+Before the patches are baked into their texture atlas, healing matches their
+tone to known background pixels with a bounded correction, then blends their
+boundary gradients with OpenCV seamless cloning. The healed atlas is reused for
+every frame in GIF, MP4, and SVG animations.
+Patches retain donor texture detail and blend into the background
 over a narrow overlap, with a 2px foreground feather at the AI detail resolution.
 Depth checks protect nearer objects from being painted over. Unmatched gaps use
 background overlap and small image fills. Turn the option off to render the raw
 surface without repairs.
-The default uses copied donor patches; it does not apply the experimental healing
-or color-matching effect. Patch selection can repeat texture or misidentify an
-ambiguous depth boundary, especially on fine details.
+Patch selection can repeat texture or misidentify an ambiguous depth boundary,
+especially on fine details; healing can soften some local detail.
 
 **3D Mesh** beneath the result opens a standalone textured viewer in your browser.
 You can orbit the geometry and show its triangles. The viewer and mesh exports use

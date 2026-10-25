@@ -10,7 +10,7 @@ from PIL import Image
 
 from ditherpal_depth.geometry import build_mesh
 from ditherpal_depth.renderer import rasterize, rasterize_alpha
-from ditherpal_depth.repairs import DonorRepair, _boundaries, _donors
+from ditherpal_depth.repairs import DonorRepair, _boundaries, _donors, _heal_patch
 from ditherpal_depth.scene import NeuralScene
 
 
@@ -31,7 +31,9 @@ class DonorRepairTests(unittest.TestCase):
                 self.assertGreater(len(repair.locations), 0)
                 atlas = repair.donors.texture
                 colors = atlas[(atlas != 0).any(axis=2)]
-                np.testing.assert_array_equal(colors, np.broadcast_to([20, 60, 220], colors.shape))
+                # OpenCV's gradient solver can round a constant channel down by
+                # one. It must still contain only the blue background, never red foreground.
+                np.testing.assert_allclose(colors, np.broadcast_to([20, 60, 220], colors.shape), rtol=0, atol=1)
                 self.assertGreater(len(repair.foreground.faces), 0)
                 for layer in [repair.background, repair.foreground, repair.donors]:
                     z = layer.vertices[layer.faces, 2]
@@ -61,8 +63,54 @@ class DonorRepairTests(unittest.TestCase):
         texture[:, 64:] = np.where(((x[:, 64:]//2+y[:, 64:]//2) % 2)[..., None],
                                    [20, 60, 220], [30, 80, 200])
         patches, _ = _donors(mesh, texture, depth, _boundaries(mesh), lambda: False, None)
-        self.assertTrue(any(np.ptp(p['copied'], axis=0).max() > 0
-                            and np.ptp(p['copied'], axis=1).max() > 0 for p in patches))
+        self.assertTrue(any(np.ptp(p['healed'], axis=0).max() > 0
+                            and np.ptp(p['healed'], axis=1).max() > 0 for p in patches))
+
+    def test_healing_matches_background_tone_without_sampling_foreground(self):
+        copied = np.full((16, 25, 3), [20, 60, 180], np.uint8)
+        across = np.linspace(-3, 12, 16, dtype=np.float32)
+        safe = np.broadcast_to((across < -.5)[:, None], copied.shape[:2])
+        original = np.full_like(copied, [240, 30, 20])
+        original[safe] = [50, 80, 200]
+        healed = _heal_patch(copied, original, safe, across)
+        np.testing.assert_array_equal(healed[0], np.broadcast_to([50, 80, 200], healed[0].shape))
+        # The unknown side may contain a foreground object: its colors must
+        # never influence the background tone correction or gradient solve.
+        original[~safe] = [0, 255, 0]
+        np.testing.assert_array_equal(healed, _heal_patch(copied, original, safe, across))
+        self.assertLess(int(healed[..., 0].max()), 100)
+        self.assertGreater(int(healed[..., 2].min()), 170)
+        original[safe] = 255
+        bounded = _heal_patch(copied, original, safe, across)
+        np.testing.assert_array_equal(bounded[0], np.broadcast_to([68, 108, 228], bounded[0].shape))
+
+    def test_healing_is_prepared_once_and_not_recomputed_during_rendering(self):
+        mesh, texture, depth = self.source()
+        with patch('ditherpal_depth.repairs._heal_patch', wraps=_heal_patch) as heal:
+            repair = DonorRepair(mesh, texture, depth)
+            prepared = heal.call_count
+            self.assertEqual(prepared, len(repair.locations))
+            self.assertGreater(prepared, 0)
+            for camera in (np.zeros(3, np.float32), np.array([0, 0, .14], np.float32)):
+                raw, z = rasterize(mesh.vertices, mesh.uv, mesh.faces, texture,
+                                   mesh.width, mesh.height, mesh.focal, camera, 0.)
+                repair.render(raw, z, mesh.focal, camera)
+            self.assertEqual(heal.call_count, prepared)
+
+    def test_cancellation_during_healing_discards_incomplete_preparation(self):
+        mesh, texture, depth = self.source()
+        interrupted = False
+
+        def heal(*args):
+            nonlocal interrupted
+            result = _heal_patch(*args)
+            interrupted = True
+            return result
+
+        with patch('ditherpal_depth.repairs._heal_patch', side_effect=heal) as solve:
+            with self.assertRaises(InterruptedError):
+                DonorRepair(mesh, texture, depth, cancelled=lambda: interrupted)
+        solve.assert_called_once()
 
     def test_patches_preserve_nearer_foreground_and_fill_missing_background(self):
         shape = (8, 8)
@@ -97,7 +145,7 @@ class DonorRepairTests(unittest.TestCase):
             for (a, _), (b, _) in zip(first, second):
                 np.testing.assert_array_equal(a, b)
             report = json.loads((Path(directory)/'report.json').read_text())
-            self.assertEqual(report['gap_repair']['method'], 'background_donor_patches')
+            self.assertEqual(report['gap_repair']['method'], 'background_healed_donor_patches')
             self.assertEqual(len(report['donor_pixels_per_frame']), 4)
             self.assertTrue((Path(directory)/'donor_patch_mask.png').is_file())
 

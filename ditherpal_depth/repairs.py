@@ -1,4 +1,4 @@
-"""Background donor patches anchored to the source surface, prepared once per animation."""
+"""Healed background donor patches, anchored once before camera animation."""
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -141,6 +141,22 @@ def _strips(mesh, edges, kind, texture, depth_map, cancelled):
     return _layer(vertices, uv, faces, alpha, texture)
 
 
+def _heal_patch(copied, original, safe_overlap, across):
+    """Match known background tone, then reconcile the donor's boundary gradients."""
+    delta = original.astype(np.float32)-copied.astype(np.float32)
+    weights = safe_overlap.astype(np.float32)
+    correction = (delta*weights[..., None]).sum(0)/np.maximum(weights.sum(0)[:, None], 1)
+    correction = cv2.GaussianBlur(correction[None], (3, 1), 0)[0]
+    correction = np.clip(correction, -48, 48)
+    fade = np.exp(-np.maximum(across, 0)/10)[:, None, None]
+    target = np.clip(copied.astype(np.float32)+correction[None]*fade, 0, 255).round().astype(np.uint8)
+    mask = np.full(copied.shape[:2], 255, np.uint8)
+    mask[[0, -1], :] = 0
+    mask[:, [0, -1]] = 0
+    height, width = copied.shape[:2]
+    return cv2.seamlessClone(copied, target, mask, (width//2, height//2), cv2.NORMAL_CLONE)
+
+
 def _donors(mesh, texture, depth_map, edges, cancelled, progress):
     dims = np.array([mesh.width-1, mesh.height-1], np.float32)
     density = max(1., (texture.shape[1]-1)/dims[0], (texture.shape[0]-1)/dims[1])
@@ -148,7 +164,7 @@ def _donors(mesh, texture, depth_map, edges, cancelled, progress):
     for index, (kind, p, q, inside) in enumerate(edges):
         _check_cancelled(cancelled)
         if index % 128 == 0 and progress:
-            progress(f'Selecting background donor patches ({index}/{len(edges)})…')
+            progress(f'Selecting and healing background donor patches ({index}/{len(edges)})…')
         if kind != 'background':
             continue
         points = mesh.uv[[p, q]]*dims
@@ -187,8 +203,11 @@ def _donors(mesh, texture, depth_map, edges, cancelled, progress):
             rejected += 1
             continue
         _, copied, offset, shift = best
+        _check_cancelled(cancelled)
+        healed = _heal_patch(copied, original, safe_overlap, across)
+        _check_cancelled(cancelled)
         patches.append(dict(points=points, tangent=tangent, normal=normal, length=float(length),
-                            copied=copied, depth=mesh.vertices[[p, q], 2], offset=offset, shift=shift))
+                            copied=copied, healed=healed, depth=mesh.vertices[[p, q], 2], offset=offset, shift=shift))
     return patches, rejected
 
 
@@ -210,7 +229,7 @@ def _atlas(mesh, patches):
     dims = np.array([mesh.width-1, mesh.height-1], np.float32)
     for patch, (x, y) in zip(patches, placements):
         h, w = patch['copied'].shape[:2]
-        texture[y-pad:y+h+pad, x-pad:x+w+pad] = cv2.copyMakeBorder(patch['copied'], pad, pad, pad, pad, cv2.BORDER_REPLICATE)
+        texture[y-pad:y+h+pad, x-pad:x+w+pad] = cv2.copyMakeBorder(patch['healed'], pad, pad, pad, pad, cv2.BORDER_REPLICATE)
         offset = len(vertices)
         for normal_distance, opacity in [(-OVERLAP, 0.), (0., 1.), (EXTENSION, 1.)]:
             for along in [-1., patch['length']+1.]:
@@ -233,7 +252,7 @@ def _blend(base, color, opacity):
 
 
 class DonorRepair:
-    """The selected donor-copy pipeline, with overlap/fill fallback and a 2px foreground feather."""
+    """Healed donors with overlap/fill fallback and a 2px foreground feather."""
 
     def __init__(self, mesh, texture, depth_map, cancelled=lambda: False, progress=None):
         _check_cancelled(cancelled)
@@ -247,7 +266,8 @@ class DonorRepair:
         _check_cancelled(cancelled)
 
     def summary(self):
-        return dict(method='background_donor_patches', patches=len(self.locations), skipped_edges=self.skipped,
+        return dict(method='background_healed_donor_patches', patches=len(self.locations), skipped_edges=self.skipped,
+                    healing='Bounded background tone matching and OpenCV NORMAL_CLONE gradient blending',
                     extension_source_pixels=EXTENSION, overlap_source_pixels=OVERLAP,
                     foreground_feather_source_pixels=FOREGROUND_FEATHER,
                     fallback='Background overlap, then Telea filling of residual gaps')

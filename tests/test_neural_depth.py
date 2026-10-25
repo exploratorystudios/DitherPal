@@ -262,6 +262,7 @@ class NeuralDepthTests(unittest.TestCase):
                 self.assertTrue((artifacts/'donor_texture.png').is_file())
                 report = json.loads((artifacts/'report.json').read_text())
                 self.assertGreater(report['gap_repair']['patches'], 0)
+                self.assertEqual(report['gap_repair']['method'], 'background_healed_donor_patches')
                 self.assertEqual(report['frames'], 4)
 
     def test_failed_camera_bake_resets_palette_without_creating_video(self):

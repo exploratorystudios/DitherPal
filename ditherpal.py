@@ -1896,7 +1896,7 @@ class DitherWorker(QThread):
             if self.isInterruptionRequested():
                 return
             if self.neural_fill_holes:
-                self.status.emit("Neural 3D zoom: preparing background donor patches…")
+                self.status.emit("Neural 3D zoom: preparing healed background patches…")
                 scene.prepare_repairs(self.isInterruptionRequested, self.depth_status)
             self.mesh_viewer_path = scene.write(artifacts, Path(self.input_path).name, self.neural_dolly)
             frames = scene.frames(artifacts, ZOOM_FRAMES, self.neural_dolly, self.neural_sway,
