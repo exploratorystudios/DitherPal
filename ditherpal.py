@@ -975,7 +975,84 @@ if NUMBA_AVAILABLE:
     block_pattern_dither = jit(nopython=True, cache=True, fastmath=True)(block_pattern_dither)
 
 
-def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palette=None):
+def _light_cell_features(src, block):
+    """Find narrow bright peaks before averaging them into art-pixel inputs."""
+    import cv2
+
+    height, width = src.shape[:2]
+    rows, cols = (height+block-1)//block, (width+block-1)//block
+    value = src.max(axis=2) if src.ndim == 3 else src
+    lightness = cv2.cvtColor(src, cv2.COLOR_RGB2LAB)[..., 0] if src.ndim == 3 else value
+    radius = max(2, min(block, 8))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius*2+1, radius*2+1))
+    broad = cv2.morphologyEx(lightness, cv2.MORPH_OPEN, kernel, borderType=cv2.BORDER_REPLICATE)
+    contrast = lightness.astype(np.float32)-broad
+    score = np.clip((contrast-12)/36, 0, 1)*np.clip((value.astype(np.float32)-96)/90, 0, 1)
+    ranked = np.pad(score*(.5+lightness.astype(np.float32)/510),
+                    ((0, rows*block-height), (0, cols*block-width)), mode='edge')
+    grouped = ranked.reshape(rows, block, cols, block).transpose(0, 2, 1, 3).reshape(rows, cols, block*block)
+    pick = grouped.argmax(axis=2)
+    y = np.minimum(np.arange(rows)[:, None]*block+pick//block, height-1)
+    x = np.minimum(np.arange(cols)[None, :]*block+pick % block, width-1)
+    confidence = score[y, x]
+    mean_lightness = cv2.resize(lightness, (cols, rows), interpolation=cv2.INTER_AREA).astype(np.float32)
+    confidence *= np.clip((lightness[y, x].astype(np.float32)-mean_lightness-12)/36, 0, 1)
+    return src[y, x], np.where(confidence >= .2, confidence, 0)
+
+
+def _palette_color_cost(features, colors):
+    """Prefer the source hue family when a compatible palette color exists."""
+    cost = ((features[:, None]-colors[None])**2).sum(axis=2)
+    if features.shape[1] == 3:
+        source_ab, palette_ab = features[:, 1:]-128, colors[:, 1:]-128
+        source_chroma = np.linalg.norm(source_ab, axis=1)
+        palette_chroma = np.linalg.norm(palette_ab, axis=1)
+        cosine = (source_ab@palette_ab.T)/np.maximum(source_chroma[:, None]*palette_chroma[None], 1e-6)
+        colored = (source_chroma[:, None] > 6) & (palette_chroma[None] > 3)
+        allowed = ~colored | (cosine >= .25)
+        usable = allowed.any(axis=1)
+        cost = np.where(allowed | ~usable[:, None], cost, np.inf)
+    return cost
+
+
+def _palette_color_families(lab):
+    """Dither ramps may reach neutrals but cannot jump between opposing hues."""
+    if lab.shape[1] != 3:
+        return np.ones((len(lab), len(lab)), bool)
+    ab = lab[:, 1:]-128
+    chroma = np.linalg.norm(ab, axis=1)
+    cosine = (ab@ab.T)/np.maximum(chroma[:, None]*chroma[None], 1e-6)
+    return (chroma[:, None] <= 3) | (chroma[None] <= 3) | (cosine >= .25)
+
+
+def _reserve_highlight_colors(colors, features, confidence):
+    """Trade redundant palette slots for rare highlights without adding colors."""
+    candidates = features[confidence.reshape(-1) > .5]
+    if not len(candidates):
+        return colors
+    colors = colors.copy()
+    reserved = []
+    for _ in range(min(3, len(colors)//6)):
+        distances = ((candidates[:, None]-colors[None])**2).sum(axis=2).min(axis=1)
+        farthest = int(distances.argmax())
+        if distances[farthest] < 16**2:
+            break
+        center = candidates[farthest]
+        neighbors = ((candidates-center)**2).sum(axis=1) < 18**2
+        center = candidates[neighbors].mean(axis=0)
+        labels = ((features[:, None]-colors[None])**2).sum(axis=2).argmin(axis=1)
+        counts = np.bincount(labels, minlength=len(colors))
+        separation = ((colors[:, None]-colors[None])**2).sum(axis=2)
+        np.fill_diagonal(separation, np.inf)
+        loss = counts*separation.min(axis=1)
+        loss[reserved] = np.inf
+        slot = int(loss.argmin())
+        colors[slot] = center
+        reserved.append(slot)
+    return colors
+
+
+def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palette=None, preserve_highlights=True):
     """True pixel-art cel shading for the Grid style: every art pixel is one solid color.
 
     The picture is shrunk to the art-pixel grid (one cell per block), banded into a small
@@ -1004,6 +1081,15 @@ def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palett
         smooth = cv2.bilateralFilter(smooth, 7, 35, 7)
     small = cv2.resize(smooth, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
 
+    highlight_confidence = np.zeros((grid_h, grid_w), np.float32)
+    if preserve_highlights:
+        peaks, highlight_confidence = _light_cell_features(src, block)
+        weight = highlight_confidence*.85
+        if channels == 3:
+            small = np.round(small*(1-weight[..., None])+peaks*weight[..., None]).astype(np.uint8)
+        else:
+            small = np.round(small*(1-weight)+peaks*weight).astype(np.uint8)
+
     # Work in Lab for color (lightness only for grayscale) so bands follow perceived color
     if channels == 3:
         cells = cv2.cvtColor(small, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -1018,16 +1104,27 @@ def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palett
         else:
             colors = fixed.reshape(-1, 1)
     else:
-        # Palette from the picture's own colors (deterministic k-means seeded across lightness)
+        # Cover hue as well as lightness so small materials do not lose their
+        # only representative to a dominant background or lighting color.
         num_colors = max(2, min(num_colors, len(features)))
-        order = np.argsort(features[:, 0])
-        colors = features[order[np.linspace(0, len(order) - 1, num_colors).astype(int)]].copy()
+        colors = np.empty((num_colors, features.shape[1]), np.float32)
+        colors[0] = features[np.argsort(features[:, 0])[len(features)//2]]
+        closest = np.full(len(features), np.inf, np.float32)
+        for k in range(1, num_colors):
+            delta = (features-colors[k-1])**2
+            if features.shape[1] == 3:
+                delta[:, 1:] *= 3
+            closest = np.minimum(closest, delta.sum(axis=1))
+            colors[k] = features[closest.argmax()]
         for _ in range(15):
-            nearest = ((features[:, None, :] - colors[None]) ** 2).sum(axis=2).argmin(axis=1)
+            nearest = _palette_color_cost(features, colors).argmin(axis=1)
             for k in range(num_colors):
                 members = features[nearest == k]
                 if len(members):
                     colors[k] = members.mean(axis=0)
+
+    if palette is None and preserve_highlights:
+        colors = _reserve_highlight_colors(colors, features, highlight_confidence)
 
     # Gate: dither only on gentle slopes - not in flat areas, not across hard edges
     lightness = cv2.GaussianBlur(cells[..., 0], (0, 0), 1.0)
@@ -1048,12 +1145,12 @@ def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palett
     rows, cols = np.mgrid[0:grid_h, 0:grid_w]
     probe = cells.copy()
     probe[..., 0] += bayer[rows % 4, cols % 4] * step * shading_dither * 2.0 * gate
-    labels = ((probe.reshape(-1, 1, probe.shape[2]) - colors[None]) ** 2).sum(axis=2).argmin(axis=1)
+    labels = _palette_color_cost(probe.reshape(-1, probe.shape[2]), colors).argmin(axis=1)
     labels = labels.reshape(grid_h, grid_w)
 
     # Pixel-art cleanup: a lone pixel matching none of its 4 neighbors in a calm area
     # is noise, so it takes the most common neighboring color
-    calm = (slope < 8.0) & (gate < 0.3)
+    calm = (slope < 8.0) & (gate < 0.3) & (highlight_confidence < .25)
     for _ in range(2):
         padded = np.pad(labels, 1, mode='edge')
         neighbors = np.stack([padded[:-2, 1:-1], padded[2:, 1:-1], padded[1:-1, :-2], padded[1:-1, 2:]])
@@ -1164,7 +1261,7 @@ def high_res_pixel_dither(image, art, block, depth, strength=0.85, extend_palett
     if extend_palette:
         palette, lab = fill_ramps(palette, lab, step * 1.2, step * 4.0)
         distance = np.sqrt(((lab[:, None] - lab[None]) ** 2).sum(axis=2))
-    ramp = distance <= step * ramp_steps
+    ramp = (distance <= step * ramp_steps) & _palette_color_families(lab)
 
     src = np.clip(image, 0, 255).astype(np.uint8)
     if channels == 3:
@@ -1210,7 +1307,7 @@ def high_res_pixel_dither(image, art, block, depth, strength=0.85, extend_palett
     texture_push = texture * np.clip(0.65 * high_pass + 0.35 * noise, -1.5, 1.5) * step * 0.7
     probe[..., 0] += texture_push * (strength / 0.85)
 
-    candidate = ((probe.reshape(-1, 1, lab.shape[1]) - lab[None]) ** 2).sum(axis=2).argmin(axis=1)
+    candidate = _palette_color_cost(probe.reshape(-1, lab.shape[1]), lab).argmin(axis=1)
     candidate = candidate.reshape(grid_h, grid_w)
     labels = np.where(ramp[labels, candidate], candidate, labels)  # only blend into neighboring shades
     return _blow_up(palette, labels, block, height, width)
@@ -1232,7 +1329,7 @@ def retro_pixel_dither(art, block, depth, strength=0.85, ramp_steps=2.5):
     height, width, _ = art.shape
     palette, labels, lab, distance, step = _art_pixel_grid(art, block)
     grid_h, grid_w = labels.shape
-    ramp = distance <= step * ramp_steps
+    ramp = (distance <= step * ramp_steps) & _palette_color_families(lab)
     light = lab[:, 0]
 
     near = cv2.resize(depth, (grid_w, grid_h), interpolation=cv2.INTER_AREA)
@@ -1435,7 +1532,7 @@ class DitherWorker(QThread):
                  cel_shade=False, cel_colors=24, cel_outlines=False, cel_dither=0.35,
                  restore_upscale=False, pixel_art_style="off", zoom_format="off", video_format="mp4", lock_video_palette=True,
                  neural_resolution=720, neural_dolly=.14, neural_sway=.02,
-                 neural_fill_holes=True, depth_strength=100):
+                 neural_fill_holes=True, depth_strength=100, preserve_highlights=True):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
@@ -1472,6 +1569,7 @@ class DitherWorker(QThread):
         self.locked_color_palette = None  # Full-color palette of the first animation frame
         self.preview_frame = None
         self.depth_strength = int(depth_strength)
+        self.preserve_highlights = preserve_highlights
         self.source_depth = None
         
         # Initialize dithering matrices
@@ -2364,12 +2462,13 @@ class DitherWorker(QThread):
             band_palette = fixed_palette if fixed_palette is not None else self.locked_palette
             if self.pixel_art_style == "off":
                 art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors,
-                                          self.cel_dither, band_palette)
+                                          self.cel_dither, band_palette, preserve_highlights=self.preserve_highlights)
                 self._lock_palette(art)
                 return art
             # Pixel art modes: flat bands first, then a depth-mapped dither drawn from real pixel
             # art laid over them on whole art pixels (pattern strength sets how much)
-            art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors, 0.0, band_palette)
+            art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors, 0.0, band_palette,
+                                      preserve_highlights=self.preserve_highlights)
             self._lock_palette(art)
             import cv2
             if depth is None:
@@ -3183,6 +3282,11 @@ class DitherApp(QMainWindow):
         self.cel_outlines_check = QCheckBox("Dark outlines (strong silhouettes only)")
         self.cel_outlines_check.setChecked(False)
         cel_layout.addWidget(self.cel_outlines_check)
+        self.light_details_check = QCheckBox("Preserve bright details")
+        self.light_details_check.setChecked(self.result_settings.value('preserve_highlights', True, type=bool))
+        self.light_details_check.setToolTip("Keep small lights and sparks within the art-pixel grid and palette. Disable for the original averaging and cleanup.")
+        self.light_details_check.toggled.connect(lambda checked: self.result_settings.setValue('preserve_highlights', checked))
+        cel_layout.addWidget(self.light_details_check)
         cel_dither_layout = QHBoxLayout()
         self.cel_dither_label = QLabel("Shading Dither (checkerboard between bands, 0% = flat):")
         self.cel_dither_label.setWordWrap(True)
@@ -3760,6 +3864,7 @@ class DitherApp(QMainWindow):
         grid = (self.method_combo.currentText() == "hybrid bayer + floyd-steinberg"
                 and self.get_hybrid_style() == "grid")
         self.cel_outlines_check.setEnabled(enabled and not grid)
+        self.light_details_check.setEnabled(enabled and grid)
         # Pixel art modes replace the shading dither with their own depth-mapped dither
         self.cel_dither_label.setEnabled(enabled and grid and not pixel_art)
         self.cel_dither_spin.setEnabled(enabled and grid and not pixel_art)
@@ -3986,7 +4091,8 @@ class DitherApp(QMainWindow):
             neural_dolly=self.neural_dolly_spin.value()/100.,
             neural_sway=self.neural_sway_spin.value()/100.,
             neural_fill_holes=self.neural_fill_check.isChecked(),
-            depth_strength=self.depth_strength
+            depth_strength=self.depth_strength,
+            preserve_highlights=self.light_details_check.isChecked()
         )
         self.worker_thread.progress.connect(self.update_progress)
         self.worker_thread.finished.connect(self.on_finished)

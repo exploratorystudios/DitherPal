@@ -213,6 +213,20 @@ suggested from image detail and stays editable. **Pattern Strength** controls th
 amount of dithering; **Color Bands** controls the image-derived cel palette (4–64).
 Custom-palette modes preserve your chosen colors.
 
+**Preserve bright details** (on by default) gives narrow bright features more
+weight before art-pixel averaging, keeps rare highlight shades within the chosen
+cel palette size, and prevents valid sparks from being removed as stray pixels.
+It applies inside grid cel shading for stills, video, and baked 3D textures.
+Every output art pixel still comes from the palette and keeps the selected block
+size. High Res can add its usual intermediate ramp shades; custom palettes stay
+exact. Disable this option to use the original averaging and cleanup.
+
+Highlight detection uses perceived brightness and contrast within each art cell
+so a strong blue channel alone does not turn an ordinary edge into a spark.
+Palette fitting covers hue as well as lightness, and shading ramps avoid opposing
+color families when compatible shades exist. This reduces cool-colored speckles
+on warm materials such as skin without removing real blue lighting.
+
 Depth is inferred from source RGB before grayscale conversion or cel shading,
 then shared with the selected pixel-art style. Re-rendering the same unchanged
 photo with different dither settings reuses the cached map.
