@@ -34,8 +34,8 @@ class DonorRepairTests(unittest.TestCase):
                 # OpenCV's gradient solver can round a constant channel down by
                 # one. It must still contain only the blue background, never red foreground.
                 np.testing.assert_allclose(colors, np.broadcast_to([20, 60, 220], colors.shape), rtol=0, atol=1)
-                self.assertGreater(len(repair.foreground.faces), 0)
-                for layer in [repair.background, repair.foreground, repair.donors]:
+                self.assertEqual(len(repair.foreground.faces), 0)
+                for layer in [repair.background, repair.donors, repair.continuation]:
                     z = layer.vertices[layer.faces, 2]
                     self.assertTrue((z.max(axis=1)/z.min(axis=1) < 1.13).all())
                 # Sampling density follows the baked texture rather than losing
@@ -84,18 +84,20 @@ class DonorRepairTests(unittest.TestCase):
         bounded = _heal_patch(copied, original, safe, across)
         np.testing.assert_array_equal(bounded[0], np.broadcast_to([68, 108, 228], bounded[0].shape))
 
-    def test_healing_is_prepared_once_and_not_recomputed_during_rendering(self):
+    def test_geometry_is_prepared_once_and_healing_is_updated_during_rendering(self):
         mesh, texture, depth = self.source()
         with patch('ditherpal_depth.repairs._heal_patch', wraps=_heal_patch) as heal:
             repair = DonorRepair(mesh, texture, depth)
             prepared = heal.call_count
             self.assertEqual(prepared, len(repair.locations))
             self.assertGreater(prepared, 0)
+            geometry = repair.donors.vertices
             for camera in (np.zeros(3, np.float32), np.array([0, 0, .14], np.float32)):
                 raw, z = rasterize(mesh.vertices, mesh.uv, mesh.faces, texture,
                                    mesh.width, mesh.height, mesh.focal, camera, 0.)
                 repair.render(raw, z, mesh.focal, camera)
-            self.assertEqual(heal.call_count, prepared)
+            self.assertGreater(heal.call_count, prepared)
+            self.assertIs(repair.donors.vertices, geometry)
 
     def test_cancellation_during_healing_discards_incomplete_preparation(self):
         mesh, texture, depth = self.source()
@@ -121,8 +123,13 @@ class DonorRepairTests(unittest.TestCase):
         blank = (np.zeros_like(raw), np.full(shape, np.inf, np.float32), np.zeros(shape, np.float32))
         donor = (np.full_like(raw, [20, 60, 220]), np.full(shape, 3, np.float32), np.ones(shape, np.float32))
         repair = DonorRepair.__new__(DonorRepair)
+        repair.cancelled = lambda: False
+        repair.mesh = SimpleNamespace(width=8)
+        repair.metadata = []
+        repair.render_count = 0
         repair.background = SimpleNamespace(render=lambda *args: blank)
         repair.foreground = SimpleNamespace(render=lambda *args: blank)
+        repair.continuation = SimpleNamespace(render=lambda *args: blank)
         repair.donors = SimpleNamespace(render=lambda *args: donor)
         result, repaired_depth, opacity, _ = repair.render(raw, depth, 10., np.zeros(3, np.float32))
         np.testing.assert_array_equal(result[:, :4], raw[:, :4])
@@ -138,14 +145,14 @@ class DonorRepairTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch('ditherpal_depth.repairs._donors', wraps=_donors) as select:
                 first = list(scene.frames(directory, count=4))
-                atlas = scene.repairs.donors.texture
+                geometry = scene.repairs.donors.vertices
                 second = list(scene.frames(directory, count=4))
-                self.assertIs(scene.repairs.donors.texture, atlas)
+                self.assertIs(scene.repairs.donors.vertices, geometry)
             select.assert_called_once()
             for (a, _), (b, _) in zip(first, second):
                 np.testing.assert_array_equal(a, b)
             report = json.loads((Path(directory)/'report.json').read_text())
-            self.assertEqual(report['gap_repair']['method'], 'background_healed_donor_patches')
+            self.assertEqual(report['gap_repair']['method'], 'background_only_healed_donor_patches')
             self.assertEqual(len(report['donor_pixels_per_frame']), 4)
             self.assertTrue((Path(directory)/'donor_patch_mask.png').is_file())
 

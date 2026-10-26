@@ -5,7 +5,7 @@ from numba import njit
 
 
 @njit(cache=True)
-def _rasterize(vertices, uv, faces, texture, width, height, focal, camera, yaw, alpha):
+def _rasterize(vertices, uv, faces, texture, width, height, focal, camera, yaw, alpha, min_depth=None):
     image = np.zeros((height, width, 3), np.uint8)
     zbuffer = np.full((height, width), np.inf, np.float32)
     opacity = np.zeros((height, width) if alpha is not None else (0, 0), np.float32)
@@ -41,6 +41,8 @@ def _rasterize(vertices, uv, faces, texture, width, height, focal, camera, yaw, 
                     continue
                 inverse_z = a/z0 + b/z1 + d/z2
                 z = 1 / inverse_z
+                if min_depth is not None and z < min_depth[y, x]:
+                    continue
                 if z >= zbuffer[y, x]:
                     continue
                 u = (a*uv[i0,0]/z0 + b*uv[i1,0]/z1 + d*uv[i2,0]/z2) * z
@@ -66,9 +68,9 @@ def rasterize(vertices, uv, faces, texture, width, height, focal, camera, yaw):
 
 
 @njit(cache=True)
-def rasterize_alpha(vertices, uv, faces, texture, width, height, focal, camera, yaw, alpha):
+def rasterize_alpha(vertices, uv, faces, texture, width, height, focal, camera, yaw, alpha, min_depth=None):
     """Render a separate layer with perspective-correct per-vertex opacity."""
-    return _rasterize(vertices, uv, faces, texture, width, height, focal, camera, yaw, alpha)
+    return _rasterize(vertices, uv, faces, texture, width, height, focal, camera, yaw, alpha, min_depth)
 
 
 def render(mesh, texture, camera=(0., 0., 0.), yaw=0., fill_holes=False):

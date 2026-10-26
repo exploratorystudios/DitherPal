@@ -18,6 +18,13 @@ __pycache__/
 /dithered/
 /test_depth_dither/
 /test_texture_map/
+/test-cnn/base_corpus/
+/test-cnn/test_corpus_1/
+/test-cnn/retro_corpus/
+/test-cnn/original_corpus/
+/test-cnn/corpus_pairs.jsonl
+/test-cnn/corpus_pairs_ready.jsonl
+/test-cnn/conversion_state/
 /Pasted image*.png
 /Clock-Gears-Moving-SnapYT.App.mp4
 

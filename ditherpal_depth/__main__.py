@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .inpaint import LAMA_MODEL, LAMA_SHA256, LAMA_URL
 from .model import DEFAULT_MODEL, download_model, image_and_depth
 
 
@@ -22,6 +23,7 @@ def main():
         parser.error('Output already exists; choose a new filename')
     if args.download_model:
         print(download_model(DEFAULT_MODEL, print))
+        print(download_model(LAMA_MODEL, print, LAMA_URL, LAMA_SHA256, 'LaMa inpainting model', 'about 208 MB'))
     if args.image:
         _, near = image_and_depth(args.image, print)
         with args.output.open('xb') as output:

@@ -34,6 +34,11 @@ class NeuralDepthTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.source = self.root/'source.png'
         Image.new('RGB', (64, 48), 'red').save(self.source)
+        # Paint hidden layers flat grey instead of downloading and running LaMa.
+        inpaint = patch('ditherpal.neural_inpaint', side_effect=lambda rgb, mask, *args, **kwargs:
+                        np.where(mask[..., None], np.uint8(128), rgb))
+        self.inpaint = inpaint.start()
+        self.addCleanup(inpaint.stop)
 
     def tearDown(self):
         self.qt.processEvents()
@@ -255,15 +260,39 @@ class NeuralDepthTests(unittest.TestCase):
                                 worker.run()
                 self.assertEqual(errors, [])
                 select.assert_called_once()
-                dither.assert_called_once()
+                # The texture, then the sky layer behind the red half, painted once each.
+                self.assertEqual(dither.call_count, 2)
                 self.assertTrue(output.is_file())
                 artifacts = Path(worker.mesh_viewer_path).parent
+                self.assertTrue((artifacts/'hidden_sky_texture.png').is_file())
                 self.assertTrue((artifacts/'repair_layers.npz').is_file())
                 self.assertTrue((artifacts/'donor_texture.png').is_file())
                 report = json.loads((artifacts/'report.json').read_text())
                 self.assertGreater(report['gap_repair']['patches'], 0)
-                self.assertEqual(report['gap_repair']['method'], 'background_healed_donor_patches')
+                self.assertEqual(report['gap_repair']['method'], 'background_only_healed_donor_patches')
+                self.assertEqual(report['gap_repair']['foreground_seam_triangles'], 0)
                 self.assertEqual(report['frames'], 4)
+                self.assertEqual(list(report['hidden_layers']['layers']), ['sky'])
+                self.assertEqual(len(report['hidden_layers']['pixels_per_frame']), 4)
+
+    def test_camera_falls_back_to_background_repair_without_the_inpainting_model(self):
+        near = np.zeros((48, 64), np.float32)
+        near[:, :32] = 1
+        output = self.root/'offline.gif'
+        worker = DitherWorker(str(self.source), str(output), 'bayer 2x2', 2, 1, 1,
+                              color_mode='full_color', zoom_format='gif')
+        errors, statuses = [], []
+        worker.error.connect(errors.append)
+        worker.status.connect(statuses.append)
+        self.inpaint.side_effect = OSError('offline')
+        with patch('ditherpal.neural_depth_for_file', return_value=near):
+            with patch('ditherpal.ZOOM_FRAMES', 2):
+                worker.run()
+        self.assertEqual(errors, [])
+        self.assertTrue(output.is_file())
+        self.assertTrue(any('hidden layers unavailable' in status for status in statuses))
+        report = json.loads((Path(worker.mesh_viewer_path).parent/'report.json').read_text())
+        self.assertIsNone(report['hidden_layers'])
 
     def test_failed_camera_bake_resets_palette_without_creating_video(self):
         output = self.root/'failed-bake.mp4'

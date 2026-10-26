@@ -30,9 +30,11 @@ def source_key(path):
         return None
 
 
-def download_model(destination=DEFAULT_MODEL, progress=None):
+def download_model(destination=DEFAULT_MODEL, progress=None, url=None, sha256=None,
+                   label='neural depth model', size='about 99 MB'):
     """Verify cached weights, or download a pinned model with atomic installation."""
     destination = Path(destination)
+    url, sha256 = url or MODEL_URL, sha256 or MODEL_SHA256
     with _lock:
         if destination.is_file():
             signature = source_key(destination)
@@ -41,8 +43,8 @@ def download_model(destination=DEFAULT_MODEL, progress=None):
                 with destination.open('rb') as existing:
                     for chunk in iter(lambda: existing.read(1024*1024), b''):
                         digest.update(chunk)
-                if digest.hexdigest() != MODEL_SHA256:
-                    raise ValueError(f'Depth model checksum failed. Remove {destination} and retry.')
+                if digest.hexdigest() != sha256:
+                    raise ValueError(f'{label.capitalize()} checksum failed. Remove {destination} and retry.')
                 _verified[str(destination)] = signature
             return destination
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -50,19 +52,19 @@ def download_model(destination=DEFAULT_MODEL, progress=None):
         temporary = Path(name)
         digest = hashlib.sha256()
         try:
-            request = urllib.request.Request(MODEL_URL, headers={'User-Agent': 'DitherPal/NeuralDepth'})
+            request = urllib.request.Request(url, headers={'User-Agent': 'DitherPal/NeuralDepth'})
             with os.fdopen(descriptor, 'wb') as output, urllib.request.urlopen(request, timeout=120) as response:
                 downloaded = 0
                 if progress:
-                    progress('Downloading neural depth model (about 99 MB, once)…')
+                    progress(f'Downloading {label} ({size}, once)…')
                 while chunk := response.read(1024*1024):
                     digest.update(chunk)
                     output.write(chunk)
                     downloaded += len(chunk)
                     if progress and downloaded//(10*1024*1024) != (downloaded-len(chunk))//(10*1024*1024):
-                        progress(f'Downloading neural depth model: {downloaded/1024**2:.0f} MiB')
-            if digest.hexdigest() != MODEL_SHA256:
-                raise ValueError('Downloaded depth model failed checksum verification')
+                        progress(f'Downloading {label}: {downloaded/1024**2:.0f} MiB')
+            if digest.hexdigest() != sha256:
+                raise ValueError(f'Downloaded {label} failed checksum verification')
             temporary.replace(destination)
             _verified[str(destination)] = source_key(destination)
         finally:

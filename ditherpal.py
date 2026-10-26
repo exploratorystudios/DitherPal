@@ -17,6 +17,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 from depth_editor import DepthMapDialog
 from ditherpal_depth import depth_for_file as neural_depth_for_file, predict_near, scale_depth
+from ditherpal_depth.inpaint import inpaint as neural_inpaint
 from ditherpal_depth.scene import NeuralScene
 import warnings
 from PyQt6.QtWidgets import (
@@ -1375,6 +1376,15 @@ def _frame_visibility(i, count, seconds):
             f'calcMode="discrete" dur="{seconds}s" repeatCount="indefinite"/>')
 
 
+def camera_workers(per_worker=.75*2**30, reserve=2.5*2**30, limit=6):
+    """Parallel camera-angle renders that fit in free memory. Workers share the scene and need
+    about 0.6 GB each for a 2048-pixel frame; beyond about six, the CPU's shared cache and
+    memory bandwidth stop paying off."""
+    import psutil
+    fits = int((psutil.virtual_memory().available-reserve)//per_worker)
+    return max(1, min(limit, NUM_CORES//2, fits))
+
+
 def write_zoom_svg_frames(path, pngs, width, height, seconds):
     """Animated SVG flipbook of PNG frames (bytes), drawn with hard pixel edges at any size.
     Used for dithers with single-pixel detail, where vector rectangles would be huge."""
@@ -1816,6 +1826,12 @@ class DitherWorker(QThread):
             return image.resize(work_size, Image.Resampling.BOX)
         return self.smart_resize(image, work_size)
 
+    def _output_cell(self, out_size):
+        """Art-pixel size in output pixels (1 without pixel art)."""
+        if not self.art_block:
+            return 1
+        return max(1, round(out_size[0]*self.art_block/self.art_size[0]))
+
     def _pixel_art_to_size(self, rendered, out_size):
         """Take one pixel per art pixel from a working render and draw the art-pixel grid at
         out_size, sampling pixel centers like a nearest-neighbor resize of the upscaled result"""
@@ -1878,10 +1894,10 @@ class DitherWorker(QThread):
         svg_frames, count, complete = [], 0, False
         self.lock_palette = True
         self.locked_palette = self.locked_color_palette = None
-        try:
-            self.status.emit("Neural 3D zoom: baking dithered texture…")
-            source = self._resize_to_work(Image.fromarray(scene.rgb), work_size)
-            texture_depth = cv2.resize(scene.near, work_size, interpolation=cv2.INTER_LINEAR)
+
+        def bake(rgb, near):
+            source = self._resize_to_work(Image.fromarray(rgb), work_size)
+            texture_depth = cv2.resize(near, work_size, interpolation=cv2.INTER_LINEAR)
             texture = np.asarray(self.apply_dithering(source, self.method, self.levels, depth=texture_depth))
             if texture.ndim == 2:
                 texture = np.repeat(texture[..., None], 3, axis=2)
@@ -1889,18 +1905,40 @@ class DitherWorker(QThread):
                 texture = np.repeat(texture, 3, axis=2)
             texture = np.ascontiguousarray(texture[..., :3], dtype=np.uint8)
             if self.art_block:
-                texture = self._pixel_art_to_size(texture, output_size)
-            elif (texture.shape[1], texture.shape[0]) != output_size:
-                texture = cv2.resize(texture, output_size, interpolation=cv2.INTER_NEAREST)
-            scene.texture = texture
+                return self._pixel_art_to_size(texture, output_size)
+            if (texture.shape[1], texture.shape[0]) != output_size:
+                return cv2.resize(texture, output_size, interpolation=cv2.INTER_NEAREST)
+            return texture
+
+        try:
+            self.status.emit("Neural 3D zoom: baking dithered texture…")
+            scene.texture = bake(scene.rgb, scene.near)
             if self.isInterruptionRequested():
                 return
             if self.neural_fill_holes:
-                self.status.emit("Neural 3D zoom: preparing healed background patches…")
-                scene.prepare_repairs(self.isInterruptionRequested, self.depth_status)
+                self.status.emit("Neural 3D zoom: preparing background-only seams…")
+                seam_art = None
+                if self.uses_depth() and self.art_block:
+                    from ditherpal_depth.seam_art import SeamPixelArt
+                    pattern = high_res_pixel_dither if self.pixel_art_style == "high_res" else retro_pixel_dither
+                    grid = ((work_size[1]+self.hybrid_cell-1)//self.hybrid_cell,
+                            (work_size[0]+self.hybrid_cell-1)//self.hybrid_cell)
+                    seam_art = SeamPixelArt(self.pixel_art_style, self.art_size, self.art_block,
+                        self.hybrid_cell, grid, self.cel_colors, self.hybrid_strength,
+                        self.preserve_highlights, pixel_art_cel_shade, pattern)
+                scene.prepare_repairs(self.isInterruptionRequested, self.depth_status, pixel_art=seam_art)
+                self.status.emit("Neural 3D zoom: painting hidden layers…")
+                try:
+                    # Hidden layers reuse the locked palette, so they match the main texture.
+                    scene.prepare_layers(neural_inpaint, bake, self.isInterruptionRequested, self.depth_status)
+                except (OSError, ValueError, RuntimeError) as error:
+                    # Missing weights or an offline first run: keep the background repair only.
+                    scene.layers = []
+                    self.status.emit(f"Neural 3D zoom: hidden layers unavailable ({error}); using background repair")
             self.mesh_viewer_path = scene.write(artifacts, Path(self.input_path).name, self.neural_dolly)
             frames = scene.frames(artifacts, ZOOM_FRAMES, self.neural_dolly, self.neural_sway,
-                                  self.neural_fill_holes, self.isInterruptionRequested, output_size=output_size)
+                                  self.neural_fill_holes, self.isInterruptionRequested, output_size=output_size,
+                                  cell=self._output_cell(output_size), workers=camera_workers())
             for result, _ in frames:
                 if self.isInterruptionRequested():
                     return
@@ -3212,7 +3250,9 @@ class DitherApp(QMainWindow):
         neural_layout.addLayout(motion_layout)
         self.neural_fill_check = QCheckBox("Fill small gaps revealed by camera motion")
         self.neural_fill_check.setChecked(True)
-        self.neural_fill_check.setToolTip("Fill seams with nearby background patches and a narrow foreground blend. Inspect the raw surface with 3D Mesh.")
+        self.neural_fill_check.setToolTip("Show inpainted hidden layers where foreground pieces pull away, and heal other gaps with background-only repair meshes. "
+                                          "Preserve the original 3D foreground. The inpainting model (about 208 MB) downloads on first use. "
+                                          "Inspect the raw surface with 3D Mesh.")
         neural_layout.addWidget(self.neural_fill_check)
         image_layout.addWidget(self.neural_widget)
         self.zoom_combo.currentIndexChanged.connect(self.update_neural_controls)

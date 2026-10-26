@@ -176,7 +176,8 @@ for every image shape. Completed render workers release their image buffers;
 the model session stays loaded to avoid reloading weights for each render.
 There is one Python environment; the app does not depend on an experimental folder.
 
-To download the model ahead of time:
+To download the models ahead of time (depth, plus the LaMa inpainting model used
+by 3D animation gap repair):
 
 ```bash
 python -m ditherpal_depth --download-model
@@ -276,18 +277,53 @@ and have a 2048-pixel output cap. SVG output is an animated sequence of embedded
 raster frames.
 
 **Fill small gaps** selects nearby background donor patches once, then attaches
-them to the scene so the same repair follows the camera throughout the animation.
-Before the patches are baked into their texture atlas, healing matches their
-tone to known background pixels with a bounded correction, then blends their
-boundary gradients with OpenCV seamless cloning. The healed atlas is reused for
-every frame in GIF, MP4, and SVG animations.
-Patches retain donor texture detail and blend into the background
-over a narrow overlap, with a 2px foreground feather at the AI detail resolution.
-Depth checks protect nearer objects from being painted over. Unmatched gaps use
-background overlap and small image fills. Turn the option off to render the raw
-surface without repairs.
-Patch selection can repeat texture or misidentify an ambiguous depth boundary,
-especially on fine details; healing can soften some local detail.
+them to background repair geometry. **The seam contains no foreground extensions
+or foreground feathering.** The original foreground stays fully 3D and keeps its
+baked dithered texture; pixels already covered by the original mesh are preserved.
+
+Each camera frame matches donor tone to visible, depth-compatible background and
+heals patch boundaries with OpenCV seamless cloning. High Res and Retro then apply
+the selected pixel-art algorithm to the repairs, using the source art-pixel grid
+and only colors found in each donor's background material. Foreground samples are
+excluded before averaging or shading. The main texture is not dithered again.
+Exact repeated repair inputs reuse a bounded pattern cache.
+
+Background texture continues up to 28 source pixels behind exposed edges. The
+extra geometry is clipped against source depth; per-frame depth checks reject
+near repair fragments before they can hide a valid farther background patch.
+Residual gaps copy accepted background repair pixels. Turn **Fill small gaps**
+off to render the raw surface without repairs.
+
+**Hidden layers** stop the background from showing through inside a subject,
+for example between an arm and the robe behind it. With **Fill small gaps** on,
+the app paints two hidden layers once with a local
+[LaMa](https://github.com/advimman/lama) inpainting model (about 208 MB, downloaded
+on first use). The sky layer paints the subject out of the scene. The inner layer
+paints out each foreground piece that stands on a steep depth step in front of the
+subject's own interior. Both layers are baked with the same dither method and
+locked palette as the main texture, meshed as continuous sheets just behind the
+surface they continue, and shown only where the camera opens a gap. Gaps that no
+layer covers fall back to the background repair. Inner gaps there are split
+between the nearer and farther surface colors in whole art pixels.
+
+The camera mesh has up to 1024 vertices along the longer side, about 2x the
+source resolution for small pixel art. Tears follow depth edges closely, and soft
+slopes such as a hand meeting an arm stretch instead of tearing open. Background
+donor patches still follow the coarser source-resolution tears.
+
+If the inpainting model cannot be downloaded or loaded, the render continues with
+background repair only and the status line says so. The subject/background split
+assumes one main subject in front of a farther background. Hidden layers are
+invented content, and they can be wrong when depth is wrong.
+
+Per-frame healing and pixel-art repair add CPU work, especially on images with
+many depth boundaries. Hidden layers add about 10 seconds of preparation, plus
+about 15 seconds the first time the inpainting model loads. The dense mesh adds
+about 1–2 seconds per large frame. Camera angles render in parallel worker processes
+(up to six, fewer when free memory is low; each needs about 0.6 GB) and share the scene's
+memory. Frames are identical to a one-at-a-time render. If a worker dies or stops
+responding, the remaining frames render one at a time. Repeated or mirrored texture, depth mistakes,
+thin edges, and complex effects such as flames can still show artifacts.
 
 **3D Mesh** beneath the result opens a standalone textured viewer in your browser.
 You can orbit the geometry and show its triangles. The viewer and mesh exports use
@@ -295,8 +331,11 @@ the same baked texture as the animation and show the original visible surface.
 OBJ/MTL, PLY, depth maps, raw peak renders, uncovered-pixel masks, and a report are
 saved in `dithered/neural-zoom/`. When gap repair adds geometry, its triangle layers
 and vertex alpha are saved separately in `repair_layers.npz`, alongside the donor
-atlas and source locations. Peak repair masks identify the covered gaps and the
-foreground feather. The raw mesh viewer does not composite these animation repairs.
+atlases and source locations. Peak repair masks identify covered gaps, and peak
+donor/continuation atlases record the frame's repair textures. Each hidden layer
+saves its mask, painted image and baked texture (`hidden_<name>_*.png`), and
+`hidden_layer_mask.png` marks the peak frame's gaps that hidden layers filled. The
+raw mesh viewer does not composite these animation repairs.
 
 This is a single-photo visible-surface reconstruction, often called 2.5D. The
 geometry has real XYZ coordinates and occlusion, but unseen object backs and
@@ -385,3 +424,5 @@ Special thanks to **[LeoBorcherding](https://github.com/LeoBorcherding)** /
 implementation and speed optimizations. Neural depth uses
 [Depth Anything V2 Small](https://github.com/DepthAnything/Depth-Anything-V2) and its
 [ONNX Community conversion](https://huggingface.co/onnx-community/depth-anything-v2-small).
+3D animation hidden layers use [LaMa](https://github.com/advimman/lama) via the
+[Carve LaMa ONNX export](https://huggingface.co/Carve/LaMa-ONNX).

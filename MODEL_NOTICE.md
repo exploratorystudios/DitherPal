@@ -14,6 +14,21 @@ See their model cards and the original project's license for the applicable term
 and attribution. Other model sizes can have different licenses and are not used
 by this application.
 
+## Inpainting model
+
+Neural 3D animation uses LaMa (big-lama) to paint hidden layers behind foreground
+depth steps.
+
+- Original project: https://github.com/advimman/lama
+- ONNX export: https://huggingface.co/Carve/LaMa-ONNX
+- Pinned export revision: `c3c0c9e468934d62e79c329e35d82dd09ff8c444`
+- File: `lama_fp32.onnx` (saved as `lama-fp32.onnx`), approximately 208 MB, fixed 512×512 input
+- SHA-256: `1faef5301d78db7dda502fe59966957ec4b79dd64e16f03ed96913c7a4eb68d6`
+
+LaMa and the ONNX export are published under Apache-2.0.
+
+## Distribution
+
 Weights are downloaded separately, verified before use, and excluded from Git.
 No model weights or training datasets are distributed in this repository.
 Source images stay on the local machine. The only network request required for

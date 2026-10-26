@@ -1,4 +1,4 @@
-"""Healed background donor patches, anchored once before camera animation."""
+"""Background-only seams: stable geometry, per-frame healing, and optional pixel art."""
 from dataclasses import dataclass
 import json
 from pathlib import Path
@@ -12,6 +12,11 @@ from .renderer import rasterize_alpha
 EXTENSION = 12.
 OVERLAP = 3.
 FOREGROUND_FEATHER = 2.
+CONTINUATION = 28.
+
+
+def _never():
+    return False
 
 
 def _check_cancelled(cancelled):
@@ -79,12 +84,12 @@ class RepairLayer:
     alpha: np.ndarray
     texture: np.ndarray
 
-    def render(self, width, height, focal, camera, yaw):
+    def render(self, width, height, focal, camera, yaw, min_depth=None):
         if not len(self.faces):
             return (np.zeros((height, width, 3), np.uint8),
                     np.full((height, width), np.inf, np.float32), np.zeros((height, width), np.float32))
         return rasterize_alpha(self.vertices, self.uv, self.faces, self.texture,
-                               width, height, focal, camera, yaw, self.alpha)
+                               width, height, focal, camera, yaw, self.alpha, min_depth)
 
 
 def _layer(vertices, uv, faces, alpha, texture):
@@ -95,7 +100,7 @@ def _layer(vertices, uv, faces, alpha, texture):
 
 
 def _strips(mesh, edges, kind, texture, depth_map, cancelled):
-    """Fallback background overlap and the tested narrow foreground feather."""
+    """Source-anchored edge strips; the repair pipeline uses background edges only."""
     vertices, uv, alpha, faces = [], [], [], []
     dims = np.array([mesh.width-1, mesh.height-1], np.float32)
     width = EXTENSION if kind == 'background' else FOREGROUND_FEATHER
@@ -207,7 +212,8 @@ def _donors(mesh, texture, depth_map, edges, cancelled, progress):
         healed = _heal_patch(copied, original, safe_overlap, across)
         _check_cancelled(cancelled)
         patches.append(dict(points=points, tangent=tangent, normal=normal, length=float(length),
-                            copied=copied, healed=healed, depth=mesh.vertices[[p, q], 2], offset=offset, shift=shift))
+                            copied=copied, healed=healed, depth=mesh.vertices[[p, q], 2], offset=offset, shift=shift,
+                            density=density, extension=EXTENSION))
     return patches, rejected
 
 
@@ -231,13 +237,14 @@ def _atlas(mesh, patches):
         h, w = patch['copied'].shape[:2]
         texture[y-pad:y+h+pad, x-pad:x+w+pad] = cv2.copyMakeBorder(patch['healed'], pad, pad, pad, pad, cv2.BORDER_REPLICATE)
         offset = len(vertices)
-        for normal_distance, opacity in [(-OVERLAP, 0.), (0., 1.), (EXTENSION, 1.)]:
+        extension = patch.get('extension', EXTENSION)
+        for normal_distance, opacity in [(-OVERLAP, 0.), (0., 1.), (extension, 1.)]:
             for along in [-1., patch['length']+1.]:
                 point = patch['points'][0]+patch['tangent']*along+patch['normal']*normal_distance
                 z = np.interp(along, [0, patch['length']], patch['depth'])
                 vertices.append([*((point-dims/2)*z/mesh.focal), z])
                 tx = x+(along+1)/(patch['length']+2)*(w-1)
-                ty = y+(normal_distance+OVERLAP)/(EXTENSION+OVERLAP)*(h-1)
+                ty = y+(normal_distance+OVERLAP)/(extension+OVERLAP)*(h-1)
                 uv.append([tx/(atlas_width-1), ty/(atlas_height-1)])
                 alpha.append(opacity)
         for row in range(2):
@@ -251,61 +258,215 @@ def _blend(base, color, opacity):
                     + color.astype(np.float32)*opacity[..., None]).astype(np.uint8)
 
 
-class DonorRepair:
-    """Healed donors with overlap/fill fallback and a 2px foreground feather."""
+def _patch_metadata(mesh, patches, atlas_width):
+    dims = np.array([mesh.width-1, mesh.height-1], np.float32)
+    x, y, row_height = 2, 2, 0
+    result = []
+    for p in patches:
+        h, w = p['copied'].shape[:2]
+        if x+w+2 > atlas_width:
+            x, y, row_height = 2, y+row_height+4, 0
+        along = np.linspace(-1., p['length']+1., w, dtype=np.float32)
+        across = np.linspace(-OVERLAP, p.get('extension', EXTENSION), h, dtype=np.float32)
+        ss, nn = np.meshgrid(along, across)
+        xy = p['points'][0]+ss[..., None]*p['tangent']+nn[..., None]*p['normal']
+        z = np.broadcast_to(np.interp(along, [0, p['length']], p['depth'])[None], (h, w))
+        result.append(dict(patch=p, world_xy=(xy-dims/2)*z[..., None]/mesh.focal,
+                           z=z, across=across, overlap=nn < -.5, slot=(x, y)))
+        x += w+4
+        row_height = max(row_height, h)
+    return result
 
-    def __init__(self, mesh, texture, depth_map, cancelled=lambda: False, progress=None):
+
+def _clipped_continuation(mesh, metadata, depth, texture, cancelled):
+    vertices, uv, faces, alpha = [], [], [], []
+    dims = np.array([mesh.width-1, mesh.height-1], np.float32)
+    for item in metadata:
         _check_cancelled(cancelled)
-        edges = _boundaries(mesh)
+        z = item['z']
+        xy = item['world_xy']*mesh.focal/z[..., None]+dims/2
+        x, y = np.rint(xy[..., 0]).astype(int), np.rint(xy[..., 1]).astype(int)
+        valid = (x >= 0) & (x < mesh.width) & (y >= 0) & (y < mesh.height)
+        source_z = depth[np.clip(y, 0, mesh.height-1), np.clip(x, 0, mesh.width-1)]
+        valid &= source_z <= z*1.03
+        h, w = z.shape
+        start = len(vertices)
+        vertices.extend(np.concatenate([item['world_xy'], z[..., None]], axis=2).reshape(-1, 3))
+        xx, yy = np.meshgrid(np.arange(w), np.arange(h))
+        x0, y0 = item['slot']
+        uv.extend(np.stack([(xx+x0)/(texture.shape[1]-1), (yy+y0)/(texture.shape[0]-1)], -1).reshape(-1, 2))
+        opacity = np.broadcast_to(np.clip((item['across']+OVERLAP)/OVERLAP, 0, 1)[:, None], (h, w))
+        alpha.extend(opacity.ravel())
+        for row in range(h-1):
+            if row % 32 == 0:
+                _check_cancelled(cancelled)
+            for col in range(w-1):
+                # Omit unsupported faces, so transparent nearer geometry cannot
+                # occlude a valid farther repair in the layer's depth buffer.
+                if valid[row:row+2, col:col+2].all():
+                    a = start+row*w+col
+                    faces.extend([(a, a+w, a+1), (a+1, a+w, a+w+1)])
+    return _layer(vertices, uv, faces, alpha, texture)
+
+
+def _frame_atlas(raw, depth, camera, focal, yaw, metadata, fixed, cancelled):
+    atlas = fixed.copy()
+    height, width = depth.shape
+    cosine, sine = np.cos(yaw), np.sin(yaw)
+    for item in metadata:
+        _check_cancelled(cancelled)
+        p = item['patch']
+        dx = item['world_xy'][..., 0]-camera[0]
+        dy = item['world_xy'][..., 1]-camera[1]
+        dz = item['z']-camera[2]
+        px, z = cosine*dx-sine*dz, sine*dx+cosine*dz
+        safe_z = np.maximum(z, 1e-9)
+        x = np.rint(focal*px/safe_z+(width-1)/2).astype(int)
+        y = np.rint(focal*dy/safe_z+(height-1)/2).astype(int)
+        inside = (x >= 0) & (x < width) & (y >= 0) & (y < height) & (z > 0)
+        cx, cy = np.clip(x, 0, width-1), np.clip(y, 0, height-1)
+        observed = depth[cy, cx]
+        safe = inside & item['overlap'] & np.isfinite(observed)
+        safe &= np.maximum(observed/safe_z, safe_z/observed) < 1.15
+        if safe.sum() < p['copied'].shape[1]:
+            continue
+        healed = _heal_patch(p['copied'], raw[cy, cx], safe, item['across'])
+        _check_cancelled(cancelled)
+        x, y = item['slot']
+        h, w = healed.shape[:2]
+        atlas[y-2:y+h+2, x-2:x+w+2] = cv2.copyMakeBorder(healed, 2, 2, 2, 2, cv2.BORDER_REPLICATE)
+    return atlas
+
+
+def _gap_background_limit(depth, radius=8):
+    known = np.isfinite(depth)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*radius+1, 2*radius+1))
+    farther = cv2.dilate(np.where(known, depth, 0).astype(np.float32), kernel)
+    nearer = cv2.erode(np.where(known, depth, np.inf).astype(np.float32), kernel)
+    boundary = (farther > 0) & np.isfinite(nearer) & (farther/nearer > 1.12)
+    limit = np.where(~known & boundary, farther/1.08, 0).astype(np.float32)
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(np.uint8(~known), 8)
+    for i in range(1, count):
+        x, y, w, h = stats[i, :4]
+        component = labels[y:y+h, x:x+w] == i
+        region = limit[y:y+h, x:x+w]
+        seeds = component & (region > 0)
+        if seeds.any():
+            _, nearest = cv2.distanceTransformWithLabels(np.uint8(~seeds), cv2.DIST_L2, 5,
+                                                          labelType=cv2.DIST_LABEL_PIXEL)
+            values = region[seeds]
+            fill = values[np.clip(nearest-1, 0, len(values)-1)]
+            region[component & (region == 0)] = fill[component & (region == 0)]
+    return limit
+
+
+class DonorRepair:
+    """Fill gaps exclusively with healed background geometry; preserve every visible source pixel."""
+
+    def __init__(self, mesh, texture, depth_map, cancelled=lambda: False, progress=None, pixel_art=None):
+        _check_cancelled(cancelled)
+        self.mesh, self.cancelled, self.pixel_art = mesh, cancelled, pixel_art
+        self.render_count = 0
+        edges = [edge for edge in _boundaries(mesh) if edge[0] == 'background']
         self.background = _strips(mesh, edges, 'background', texture, depth_map, cancelled)
-        self.foreground = _strips(mesh, edges, 'foreground', texture, depth_map, cancelled)
+        # Retain an empty export entry for older repair-layer readers.
+        self.foreground = _layer([], [], [], [], texture)
         patches, self.skipped = _donors(mesh, texture, depth_map, edges, cancelled, progress)
         self.donors = _atlas(mesh, patches)
+        self._fixed = self.donors.texture
+        self.metadata = _patch_metadata(mesh, patches, self._fixed.shape[1])
+        if pixel_art is not None:
+            pixel_art.prepare(mesh, texture, depth_map, self.metadata, cancelled)
+        expanded = []
+        for p, item in zip(patches, self.metadata):
+            _check_cancelled(cancelled)
+            q = dict(p)
+            height = int(np.ceil((CONTINUATION+OVERLAP)*p['density']))+1
+            extra = height-p['copied'].shape[0]
+            q['copied'] = cv2.copyMakeBorder(p['copied'], 0, extra, 0, 0, cv2.BORDER_REFLECT_101)
+            q['healed'] = cv2.copyMakeBorder(p['healed'], 0, extra, 0, 0, cv2.BORDER_REFLECT_101)
+            q['extension'] = CONTINUATION
+            if pixel_art is not None and item['art_context'] is not None:
+                q['allowed_background_palette'] = item['art_context']['palette']
+            expanded.append(q)
+        expanded_atlas = _atlas(mesh, expanded)
+        self._extended_fixed = expanded_atlas.texture
+        self.extended_metadata = _patch_metadata(mesh, expanded, self._extended_fixed.shape[1])
+        if pixel_art is not None:
+            pixel_art.prepare(mesh, texture, depth_map, self.extended_metadata, cancelled)
+        self.continuation = _clipped_continuation(mesh, self.extended_metadata, depth_map,
+                                                  self._extended_fixed, cancelled)
         self.locations = [dict(points=p['points'].tolist(), normal=p['normal'].tolist(),
                                tangent=p['tangent'].tolist(), offset=p['offset'], shift=p['shift']) for p in patches]
         _check_cancelled(cancelled)
 
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state['cancelled'] = _never
+        return state
+
     def summary(self):
-        return dict(method='background_healed_donor_patches', patches=len(self.locations), skipped_edges=self.skipped,
-                    healing='Bounded background tone matching and OpenCV NORMAL_CLONE gradient blending',
-                    extension_source_pixels=EXTENSION, overlap_source_pixels=OVERLAP,
-                    foreground_feather_source_pixels=FOREGROUND_FEATHER,
-                    fallback='Background overlap, then Telea filling of residual gaps')
+        return dict(method='background_only_healed_donor_patches', patches=len(self.locations), skipped_edges=self.skipped,
+                    healing='Per-frame background tone matching and OpenCV NORMAL_CLONE',
+                    pixel_art=self.pixel_art.style if self.pixel_art is not None else 'off',
+                    extension_source_pixels=CONTINUATION, overlap_source_pixels=OVERLAP,
+                    foreground_seam_triangles=0, foreground_feather_source_pixels=0,
+                    fallback='Copy accepted background repair pixels only')
 
     def write(self, folder):
         folder = Path(folder)
-        if not any(len(layer.faces) for layer in [self.background, self.foreground, self.donors]):
+        layers = [('background', self.background), ('foreground', self.foreground),
+                  ('donors', self.donors), ('continuation', self.continuation)]
+        if not any(len(layer.faces) for _, layer in layers):
             return
         arrays = {}
-        for name, layer in [('background', self.background), ('foreground', self.foreground), ('donors', self.donors)]:
+        for name, layer in layers:
             for key in ['vertices', 'uv', 'faces', 'alpha']:
                 arrays[f'{name}_{key}'] = getattr(layer, key)
         np.savez_compressed(folder/'repair_layers.npz', **arrays)
         if len(self.donors.faces):
             Image.fromarray(self.donors.texture).save(folder/'donor_texture.png')
+            Image.fromarray(self.continuation.texture).save(folder/'continuation_texture.png')
         (folder/'donor_locations.json').write_text(json.dumps(self.locations, indent=2)+'\n')
 
+    def write_peak(self, folder):
+        if len(self.donors.faces):
+            Image.fromarray(self.donors.texture).save(Path(folder)/'peak_donor_texture.png')
+            Image.fromarray(self.continuation.texture).save(Path(folder)/'peak_continuation_texture.png')
+
     def render(self, raw, depth, focal, camera, yaw=0.):
+        cancelled = self.cancelled
+        _check_cancelled(cancelled)
         height, width = raw.shape[:2]
         missing = ~np.isfinite(depth)
-        background, background_z, _ = self.background.render(width, height, focal, camera, yaw)
-        supplied = missing & np.isfinite(background_z)
-        base = raw.copy()
-        base[supplied] = background[supplied]
+        result, repaired_depth = raw.copy(), depth.copy()
+        supplied = np.zeros(missing.shape, bool)
+        zero = np.zeros(missing.shape, np.float32)
+        if not missing.any():
+            return result, repaired_depth, zero, zero.copy()
+        if self.metadata:
+            atlas = _frame_atlas(raw, depth, camera, focal, yaw, self.metadata, self._fixed, cancelled)
+            extended = _frame_atlas(raw, depth, camera, focal, yaw, self.extended_metadata,
+                                     self._extended_fixed, cancelled)
+            if self.pixel_art is not None:
+                atlas = self.pixel_art.dither(atlas, self.metadata, cancelled)
+                extended = self.pixel_art.dither(extended, self.extended_metadata, cancelled)
+            self.donors.texture, self.continuation.texture = atlas, extended
+        limit = _gap_background_limit(depth, radius=max(1, round(8*width/self.mesh.width)))
+        for layer in (self.background, self.continuation, self.donors):
+            _check_cancelled(cancelled)
+            color, z, alpha = layer.render(width, height, focal, camera, yaw, limit)
+            take = missing & np.isfinite(z) & (alpha > .01)
+            result[take], repaired_depth[take] = color[take], z[take]
+            supplied[take] = True
         remaining = missing & ~supplied
-        if remaining.any() and not remaining.all():
-            base = cv2.inpaint(base, np.uint8(remaining)*255, 3, cv2.INPAINT_TELEA)
-        combined_depth = depth.copy()
-        combined_depth[supplied] = background_z[supplied]
-        color, patch_z, alpha = self.donors.render(width, height, focal, camera, yaw)
-        same_background = np.zeros_like(missing)
-        known = ~missing & np.isfinite(patch_z)
-        same_background[known] = np.maximum(patch_z[known]/depth[known], depth[known]/patch_z[known]) < 1.03
-        visible = np.isfinite(patch_z) & (missing | same_background)
-        opacity = np.where(visible, np.clip(alpha, 0, 1), 0)
-        repaired = _blend(base, color, opacity)
-        combined_depth[missing & visible] = patch_z[missing & visible]
-        foreground, foreground_z, foreground_alpha = self.foreground.render(width, height, focal, camera, yaw)
-        feather = np.where(foreground_z < combined_depth-1e-5, np.clip(foreground_alpha, 0, 1), 0)
-        repaired = _blend(repaired, foreground, feather)
-        return repaired, combined_depth, opacity, feather
+        if remaining.any() and supplied.any():
+            _, nearest = cv2.distanceTransformWithLabels(np.uint8(~supplied), cv2.DIST_L2, 5,
+                                                          labelType=cv2.DIST_LABEL_PIXEL)
+            indices = np.clip(nearest-1, 0, int(supplied.sum())-1)
+            colors, depths = result[supplied], repaired_depth[supplied]
+            result[remaining] = colors[indices[remaining]]
+            repaired_depth[remaining] = depths[indices[remaining]]
+        self.render_count += 1
+        _check_cancelled(cancelled)
+        return result, repaired_depth, supplied.astype(np.float32), zero

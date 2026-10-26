@@ -68,9 +68,11 @@ def write_obj(folder, mesh):
     (folder / "scene.mtl").write_text("newmtl photo\nKd 1 1 1\nKa 1 1 1\nmap_Kd texture.png\n")
     with (folder / "scene.obj").open("w") as output:
         output.write("mtllib scene.mtl\nusemtl photo\n")
-        for x, y, z in mesh.vertices:
-            output.write(f"v {x:.7g} {-y:.7g} {-z:.7g}\n")
-        for u, v in mesh.uv:
-            output.write(f"vt {u:.7g} {1-v:.7g}\n")
-        for face in mesh.faces + 1:
-            output.write("f " + " ".join(f"{i}/{i}" for i in face) + "\n")
+        # Dense meshes have millions of lines; format them in bulk rather than one by one.
+        for rows, line in ((mesh.vertices.astype(np.float64) * [1, -1, -1], "v %.7g %.7g %.7g\n"),
+                           (np.column_stack((mesh.uv[:, 0], 1 - mesh.uv[:, 1].astype(np.float64))), "vt %.7g %.7g\n"),
+                           (np.repeat(mesh.faces + 1, 2, axis=1).tolist(), "f %d/%d %d/%d %d/%d\n")):
+            rows = rows if isinstance(rows, list) else rows.tolist()
+            for start in range(0, len(rows), 65536):
+                chunk = rows[start:start + 65536]
+                output.write((line * len(chunk)) % tuple(value for row in chunk for value in row))
