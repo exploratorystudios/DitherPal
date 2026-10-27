@@ -976,8 +976,9 @@ if NUMBA_AVAILABLE:
     block_pattern_dither = jit(nopython=True, cache=True, fastmath=True)(block_pattern_dither)
 
 
-def _light_cell_features(src, block):
-    """Find narrow bright peaks before averaging them into art-pixel inputs."""
+def _light_cell_features(src, block, mask=None):
+    """Find narrow bright peaks before averaging them into art-pixel inputs.
+    mask (HxW bool, optional) marks the visible subject of a transparent image."""
     import cv2
 
     height, width = src.shape[:2]
@@ -997,8 +998,41 @@ def _light_cell_features(src, block):
     x = np.minimum(np.arange(cols)[None, :]*block+pick % block, width-1)
     confidence = score[y, x]
     mean_lightness = cv2.resize(lightness, (cols, rows), interpolation=cv2.INTER_AREA).astype(np.float32)
-    confidence *= np.clip((lightness[y, x].astype(np.float32)-mean_lightness-12)/36, 0, 1)
+    peak = lightness[y, x].astype(np.float32)
+    confidence *= np.clip((peak-mean_lightness-12)/36, 0, 1)
+    # A light outshines its neighboring art pixels too; skin or cloth between two dark lines
+    # (a lid between lashes and brow) is a local peak but no brighter than the area around it.
+    ring = np.ones((3, 3), np.uint8)
+    ring[1, 1] = 0
+    surround = cv2.dilate(mean_lightness, ring, borderType=cv2.BORDER_REPLICATE)
+    confidence *= np.clip((peak-surround-4)/16, 0, 1)
+    confidence *= _light_source_gate(lightness, mask)
     return src[y, x], np.where(confidence >= .2, confidence, 0)
+
+
+def _light_source_gate(lightness, mask=None):
+    """1 for a picture with light sources, fading to 0 for one that is merely lit.
+    A heatmap of pixels far above the picture's own median brightness shows lights as a few
+    concentrated hotspots (a glowing book or staff: 4-6% of the frame), while a lit painting
+    is bright across broad areas (face, hands and sky: 20%). Highlight preservation would
+    only spend palette colors on those broad areas and wash the darks out.
+    With a mask (the visible subject of a transparent image) only the subject is measured."""
+    import cv2
+
+    height, width = lightness.shape[:2]
+    size = max(1, round(width*min(1., 256/max(height, width)))), max(1, round(height*min(1., 256/max(height, width))))
+    small = cv2.resize(lightness, size, interpolation=cv2.INTER_AREA).astype(np.float32)
+    inside = np.ones(small.shape, np.float32) if mask is None else \
+        (cv2.resize(mask.astype(np.float32), size, interpolation=cv2.INTER_AREA) >= .5).astype(np.float32)
+    if not inside.any():
+        return 1.
+    median = float(np.median(small[inside > 0]))
+    bright = (small > median+.5*(255-median)).astype(np.float32)*inside
+    sigma = max(small.shape)/40
+    # Density among visible pixels only, so the subject's edge is not diluted by the background
+    density = cv2.GaussianBlur(bright, (0, 0), sigma)/np.maximum(cv2.GaussianBlur(inside, (0, 0), sigma), 1e-6)
+    hot = float(((density > .25)*inside).sum()/inside.sum())
+    return float(np.clip((.15-hot)/.07, 0, 1))
 
 
 def _palette_color_cost(features, colors):
@@ -1053,7 +1087,67 @@ def _reserve_highlight_colors(colors, features, confidence):
     return colors
 
 
-def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palette=None, preserve_highlights=True):
+def split_alpha(image):
+    """Separate a transparent image's alpha (HxW uint8) from its color. Hidden pixels take the
+    nearest visible color, so the transparent background (often black or leftover edge color)
+    cannot tint edge art pixels, enter the palette or skew brightness measurements.
+    Returns (RGB image, alpha), or (image, None) when nothing is transparent."""
+    import cv2
+
+    if image.mode not in ('RGBA', 'LA', 'PA') and not (image.mode == 'P' and 'transparency' in image.info):
+        return image, None
+    rgba = np.array(image.convert('RGBA'))
+    alpha = rgba[..., 3]
+    visible = alpha >= 128
+    if visible.all() or not visible.any():
+        return image.convert('RGB'), None
+    _, nearest = cv2.distanceTransformWithLabels(np.uint8(~visible), cv2.DIST_L2, 3, labelType=cv2.DIST_LABEL_PIXEL)
+    rows, cols = np.nonzero(visible)
+    lookup = np.zeros(nearest.max()+1, np.int64)
+    lookup[nearest[rows, cols]] = rows*alpha.shape[1]+cols
+    rgb = rgba[..., :3].reshape(-1, 3)[lookup[nearest]].reshape(rgba.shape[:2]+(3,))
+    return Image.fromarray(np.ascontiguousarray(rgb)), alpha
+
+
+def _off_hue_share(features):
+    """Share of the colored cells (Lab) whose hue is over 60 degrees from the dominant hue:
+    about 0.04 for a sepia portrait, 0.2-0.25 for a scene lit by fire and magic."""
+    ab = features[:, 1:]-128
+    chroma = np.hypot(ab[:, 0], ab[:, 1])
+    colored = chroma > 6
+    if not colored.any():
+        return 0.
+    hue = np.arctan2(ab[colored, 1], ab[colored, 0])
+    dominant = np.angle((chroma[colored]*np.exp(1j*hue)).sum())
+    return float((np.abs(np.angle(np.exp(1j*(hue-dominant)))) > np.pi/3).mean())
+
+
+def _seed_palette(features, num_colors):
+    """Starting colors for the palette k-means. Most follow the picture's lightness
+    distribution, so shadows and midtones keep enough steps to model form; the rest
+    go to the colors farthest from those (hue counted triple), so small materials
+    and lights do not lose their only representative to a dominant color. A picture
+    in one hue family gives a quarter of the palette to that, one with many hues half."""
+    order = np.argsort(features[:, 0])
+    if features.shape[1] == 3:
+        spread = float(np.clip(3*_off_hue_share(features), .25, .5))
+        ramp = max(1, round(num_colors*(1-spread)))
+    else:
+        ramp = num_colors
+    colors = np.empty((num_colors, features.shape[1]), np.float32)
+    colors[:ramp] = features[order[np.linspace(0, len(order)-1, ramp).astype(int)]]
+    weight = np.ones(features.shape[1], np.float32)
+    weight[1:] = 3
+    closest = np.full(len(features), np.inf, np.float32)
+    for k in range(num_colors):
+        if k >= ramp:
+            colors[k] = features[closest.argmax()]
+        closest = np.minimum(closest, (((features-colors[k])**2)*weight).sum(axis=1))
+    return colors
+
+
+def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palette=None, preserve_highlights=True,
+                        mask=None):
     """True pixel-art cel shading for the Grid style: every art pixel is one solid color.
 
     The picture is shrunk to the art-pixel grid (one cell per block), banded into a small
@@ -1061,7 +1155,9 @@ def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palett
     whole art pixels as a checkerboard where the image has a gentle gradient - flat areas
     stay solid. Stray single pixels in calm areas are cleaned up, then the grid is blown
     back up with nearest-neighbor to the image size.
-    image is HxWxC float (C = 3 or 1); palette is an optional KxC array of fixed colors."""
+    image is HxWxC float (C = 3 or 1); palette is an optional KxC array of fixed colors.
+    mask (HxW bool, optional) marks the visible subject of a transparent image: the palette
+    and light detection use only those art pixels, so the hidden background spends none."""
     try:
         import cv2
     except ImportError:
@@ -1084,7 +1180,7 @@ def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palett
 
     highlight_confidence = np.zeros((grid_h, grid_w), np.float32)
     if preserve_highlights:
-        peaks, highlight_confidence = _light_cell_features(src, block)
+        peaks, highlight_confidence = _light_cell_features(src, block, mask)
         weight = highlight_confidence*.85
         if channels == 3:
             small = np.round(small*(1-weight[..., None])+peaks*weight[..., None]).astype(np.uint8)
@@ -1097,6 +1193,12 @@ def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palett
     else:
         cells = small.astype(np.float32)[..., None]
     features = cells.reshape(-1, cells.shape[2])
+    visible = np.ones(grid_h*grid_w, bool)
+    if mask is not None and mask.shape == (height, width):
+        cover = cv2.resize(mask.astype(np.float32), (grid_w, grid_h), interpolation=cv2.INTER_AREA).reshape(-1) >= .5
+        if cover.any():
+            visible = cover
+    subject = features[visible]
 
     if palette is not None:
         fixed = np.clip(np.asarray(palette, dtype=np.float32), 0, 255)
@@ -1105,27 +1207,17 @@ def pixel_art_cel_shade(image, block, num_colors=24, shading_dither=0.35, palett
         else:
             colors = fixed.reshape(-1, 1)
     else:
-        # Cover hue as well as lightness so small materials do not lose their
-        # only representative to a dominant background or lighting color.
-        num_colors = max(2, min(num_colors, len(features)))
-        colors = np.empty((num_colors, features.shape[1]), np.float32)
-        colors[0] = features[np.argsort(features[:, 0])[len(features)//2]]
-        closest = np.full(len(features), np.inf, np.float32)
-        for k in range(1, num_colors):
-            delta = (features-colors[k-1])**2
-            if features.shape[1] == 3:
-                delta[:, 1:] *= 3
-            closest = np.minimum(closest, delta.sum(axis=1))
-            colors[k] = features[closest.argmax()]
+        num_colors = max(2, min(num_colors, len(subject)))
+        colors = _seed_palette(subject, num_colors)
         for _ in range(15):
-            nearest = _palette_color_cost(features, colors).argmin(axis=1)
+            nearest = _palette_color_cost(subject, colors).argmin(axis=1)
             for k in range(num_colors):
-                members = features[nearest == k]
+                members = subject[nearest == k]
                 if len(members):
                     colors[k] = members.mean(axis=0)
 
     if palette is None and preserve_highlights:
-        colors = _reserve_highlight_colors(colors, features, highlight_confidence)
+        colors = _reserve_highlight_colors(colors, subject, highlight_confidence.reshape(-1)[visible])
 
     # Gate: dither only on gentle slopes - not in flat areas, not across hard edges
     lightness = cv2.GaussianBlur(cells[..., 0], (0, 0), 1.0)
@@ -1580,6 +1672,7 @@ class DitherWorker(QThread):
         self.preview_frame = None
         self.depth_strength = int(depth_strength)
         self.preserve_highlights = preserve_highlights
+        self.work_mask = None  # Visible subject of a transparent still, at the working size
         self.native_pixel_size = native_pixel_size
         self.source_depth = None
         
@@ -1661,6 +1754,8 @@ class DitherWorker(QThread):
         """Process a single static image with efficient scaling and chunk processing"""
         self.progress.emit(10)
 
+        image, alpha = split_alpha(image)
+
         # Check if we need chunk processing BEFORE upscaling
         width, height = image.size
         pixel_count_after_upscale = width * self.upsample * height * self.upsample
@@ -1670,8 +1765,26 @@ class DitherWorker(QThread):
 
         if self.art_block:
             work_size = self._setup_pixel_art_grid(width, height)
-            rendered = self.apply_dithering(self._resize_to_work(image, work_size), self.method, self.levels)
-            dithered_array = self._pixel_art_to_size(rendered, self._output_size(width, height, original_size))
+            if alpha is not None:
+                import cv2
+                self.work_mask = cv2.resize(alpha, work_size, interpolation=cv2.INTER_AREA) >= 128
+            try:
+                rendered = self.apply_dithering(self._resize_to_work(image, work_size), self.method, self.levels)
+            finally:
+                visible, self.work_mask = self.work_mask, None
+            out_size = self._output_size(width, height, original_size)
+            dithered_array = self._pixel_art_to_size(rendered, out_size)
+            if visible is not None:
+                # Each art pixel is wholly visible or hidden, like a sprite: visible when the
+                # subject covers at least half of it
+                cell = self.hybrid_cell
+                gh, gw = rendered[::cell, ::cell].shape[:2]
+                padded = np.zeros((gh*cell, gw*cell), np.float32)
+                padded[:visible.shape[0], :visible.shape[1]] = visible
+                cover = padded.reshape(gh, cell, gw, cell).mean(axis=(1, 3)) >= .5
+                if not self.exports_native_pixels():
+                    cover = self._grid_to_size(cover, out_size)
+                alpha = np.where(cover, 255, 0).astype(np.uint8)
         elif use_chunks:
             # Process with chunks - pass original image
             dithered_array = self.process_with_chunks(image, self.method, self.levels, self.upsample, self.output_path)
@@ -1778,6 +1891,12 @@ class DitherWorker(QThread):
         if (self.restore_upscale and self.upsample > 1 and not self.exports_native_pixels()
                 and dithered_image.size != original_size):
             dithered_image = dithered_image.resize(original_size, Image.Resampling.NEAREST)
+
+        if alpha is not None and self.output_path.lower().endswith(('.png', '.webp')):
+            if alpha.shape != dithered_image.size[::-1]:
+                alpha = np.array(Image.fromarray(alpha).resize(dithered_image.size, Image.Resampling.BOX))
+            dithered_image = dithered_image.convert('LA' if dithered_image.mode == 'L' else 'RGBA')
+            dithered_image.putalpha(Image.fromarray(alpha))
 
         # Save with maximum PNG compression for optimal file size
         if self.output_path.lower().endswith('.png'):
@@ -2530,13 +2649,14 @@ class DitherWorker(QThread):
             band_palette = fixed_palette if fixed_palette is not None else self.locked_palette
             if self.pixel_art_style == "off":
                 art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors,
-                                          self.cel_dither, band_palette, preserve_highlights=self.preserve_highlights)
+                                          self.cel_dither, band_palette, preserve_highlights=self.preserve_highlights,
+                                          mask=self.work_mask)
                 self._lock_palette(art)
                 return art
             # Pixel art modes: flat bands first, then a depth-mapped dither drawn from real pixel
             # art laid over them on whole art pixels (pattern strength sets how much)
             art = pixel_art_cel_shade(img_array, self.hybrid_cell, self.cel_colors, 0.0, band_palette,
-                                      preserve_highlights=self.preserve_highlights)
+                                      preserve_highlights=self.preserve_highlights, mask=self.work_mask)
             self._lock_palette(art)
             import cv2
             if depth is None:
