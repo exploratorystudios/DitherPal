@@ -1634,7 +1634,8 @@ class DitherWorker(QThread):
                  cel_shade=False, cel_colors=24, cel_outlines=False, cel_dither=0.35,
                  restore_upscale=False, pixel_art_style="off", zoom_format="off", video_format="mp4", lock_video_palette=True,
                  neural_resolution=720, neural_dolly=.14, neural_sway=.02,
-                 neural_fill_holes=True, depth_strength=100, preserve_highlights=True, native_pixel_size=False):
+                 neural_fill_holes=True, depth_strength=100, preserve_highlights=True, native_pixel_size=False,
+                 consolidate=False):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
@@ -1644,6 +1645,15 @@ class DitherWorker(QThread):
         self.downscale = max(1, int(downscale))  # Pre-dither shrink factor (pixelation)
         self.restore_size = restore_size  # Scale back to original size with nearest-neighbor
         self.restore_upscale = restore_upscale  # Shrink an upscaled result back to original size
+        # Consolidate: shrink by the downscale factor, then enlarge by the upscale factor, and
+        # dither that as the source at 1x. Both factors are spent there, not in the usual pipeline
+        self.consolidate = consolidate and self.downscale > 1 and upsample > 1
+        self.restore_consolidated = False
+        if self.consolidate:
+            self.consolidate_factors = (self.downscale, upsample)
+            self.restore_consolidated = restore_size or restore_upscale
+            self.downscale = self.upsample = 1
+            self.restore_size = self.restore_upscale = False
         self.use_grayscale = use_grayscale
         self.color_mode = color_mode  # "bw", "full_color", "custom"
         self.custom_colors = custom_colors or []
@@ -1916,7 +1926,8 @@ class DitherWorker(QThread):
         if self.exports_native_pixels():
             block = getattr(self, 'art_block', None) or self.hybrid_cell
             return tuple((n*self.upsample+block-1)//block for n in (width, height))
-        if (self.downscale > 1 and self.restore_size) or (self.restore_upscale and self.upsample > 1):
+        if ((self.downscale > 1 and self.restore_size) or (self.restore_upscale and self.upsample > 1)
+                or self.restore_consolidated):
             return original_size
         return width * self.upsample, height * self.upsample
 
@@ -2296,12 +2307,36 @@ class DitherWorker(QThread):
 
     def downscale_image(self, image):
         """Shrink image by the downscale factor before dithering (pixelation)"""
+        if self.consolidate:
+            return self.consolidate_image(image)
         if self.downscale <= 1:
             return image
         width, height = image.size
         new_size = (max(1, width // self.downscale), max(1, height // self.downscale))
         # BOX averages each block of source pixels, giving clean pixel-art colors
         return image.resize(new_size, Image.Resampling.BOX)
+
+    def consolidated_size(self, width, height):
+        """Size of the consolidated source for a width x height original"""
+        if self.restore_consolidated and not self.art_block:
+            # Only solid pixel art can draw its grid at the original size afterwards; other
+            # styles would lose their dither pattern to a nearest-neighbor shrink, so they
+            # are dithered at the original size instead
+            return width, height
+        down, up = self.consolidate_factors
+        return max(1, width // down) * up, max(1, height // down) * up
+
+    def consolidate_image(self, image):
+        """Downscale then upscale: BOX averaging merges fine detail within each block, and the
+        Lanczos enlargement sharpens part of it back, which neither resize does on its own"""
+        if image.mode not in ('L', 'LA', 'RGB', 'RGBA'):
+            image = image.convert('RGBA' if image.mode == 'PA' or 'transparency' in image.info else 'RGB')
+        down = self.consolidate_factors[0]
+        size = self.consolidated_size(*image.size)
+        if size[0] * size[1] * 4 > self._get_available_memory() * 0.5:
+            raise MemoryError(f"Not enough memory to consolidate at {size[0]}x{size[1]} px - lower the Upscale Factor")
+        small = image.resize((max(1, image.width // down), max(1, image.height // down)), Image.Resampling.BOX)
+        return small.resize(size, Image.Resampling.LANCZOS)
 
     def smart_resize(self, image, new_size):
         """Intelligently resize image based on scale factor"""
@@ -2470,7 +2505,8 @@ class DitherWorker(QThread):
             if width <= 0 or height <= 0:
                 raise ValueError("Video has invalid dimensions")
             self.status.emit(f"Processing video: {total_frames} frames @ {fps:.2f} FPS ({width}x{height})")
-            source_size = (max(1, width // self.downscale), max(1, height // self.downscale))
+            source_size = (self.consolidated_size(width, height) if self.consolidate else
+                           (max(1, width // self.downscale), max(1, height // self.downscale)))
             dither_size = (source_size[0] * self.upsample, source_size[1] * self.upsample)
             output_size = self._output_size(*source_size, (width, height))
             if self.video_format == "mp4":
@@ -2496,6 +2532,8 @@ class DitherWorker(QThread):
                     frame_depth = (scale_depth(predict_near(rgb, self.depth_status), self.depth_strength)
                                    if self.uses_depth() else None)
                     depth_batch.append(frame_depth)
+                    if self.consolidate:
+                        rgb = np.asarray(self.consolidate_image(Image.fromarray(rgb)))
                     if self.downscale > 1:
                         rgb = cv2.resize(rgb, source_size, interpolation=cv2.INTER_AREA)
                     if self.art_block:
@@ -3148,6 +3186,9 @@ class DitherApp(QMainWindow):
             padding: 0 3px 0 3px;
             color: #60a5fa;
         }
+        QGroupBox[scaleActive="true"] {
+            border: 2px solid #3b82f6;
+        }
         QPushButton {
             background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
                                       stop:0 #3b82f6, stop:1 #1e40af);
@@ -3201,6 +3242,16 @@ class DitherApp(QMainWindow):
         QLabel {
             color: #e0e0e0;
             font-size: 13px;
+        }
+        QLabel:disabled, QCheckBox:disabled, QSpinBox:disabled, QComboBox:disabled {
+            color: #4b5563;
+        }
+        QSpinBox:disabled, QComboBox:disabled, QCheckBox::indicator:disabled {
+            background-color: #141b26;
+            border-color: #1e293b;
+        }
+        QCheckBox::indicator:checked:disabled {
+            background: #1e3a5f;
         }
         QProgressBar {
             border: 1px solid #334155;
@@ -3583,6 +3634,7 @@ class DitherApp(QMainWindow):
 
         upsample_group.setLayout(upsample_layout)
         left_layout.addWidget(upsample_group)
+        self.upsample_group = upsample_group
 
         # Downscaling (pixelation)
         downscale_group = QGroupBox("Downscale (Pixelate)")
@@ -3600,9 +3652,27 @@ class DitherApp(QMainWindow):
         downscale_layout.addWidget(self.restore_size_check)
         self.downscale_spin.valueChanged.connect(self.update_downscale_label)
         self.restore_size_check.toggled.connect(self.update_dimensions_text)
+        self.consolidate_check = QCheckBox("Downscale, then upscale (consolidate details)")
+        self.consolidate_check.setChecked(self.result_settings.value('consolidate', False, type=bool))
+        self.consolidate_check.toggled.connect(lambda checked: self.result_settings.setValue('consolidate', checked))
+        self.consolidate_check.toggled.connect(self.on_consolidate_toggled)
+        self.downscale_spin.valueChanged.connect(self.on_scale_changed)
+        self.upsample_spin.valueChanged.connect(self.on_scale_changed)
+        downscale_layout.addWidget(self.consolidate_check)
+        consolidate_note = QLabel("For large or hyper-detailed images. Shrinks by the Downscale Factor to merge "
+                                  "fine detail, then enlarges by the Upscale Factor to win some of it back before "
+                                  "dithering, which downscaling or upscaling alone can't do. Needs both factors above "
+                                  "1x; either \"original size\" option scales the result back.")
+        consolidate_note.setWordWrap(True)
+        consolidate_note.setStyleSheet("color: gray; font-size: 11px;")
+        downscale_layout.addWidget(consolidate_note)
 
         downscale_group.setLayout(downscale_layout)
         left_layout.addWidget(downscale_group)
+        self.downscale_group = downscale_group
+        self.last_scale_edit = self.upsample_spin
+        self.applying_scale_preset = False
+        self.update_scale_controls()
         
         # Output directory
         output_group = QGroupBox("Output")
@@ -3994,7 +4064,7 @@ class DitherApp(QMainWindow):
         if self.get_pixel_art_style() != "off" and self.current_image_path:
             self.apply_pixel_art_settings(auto_grid=False)
 
-    def apply_pixel_art_settings(self, auto_grid=True):
+    def apply_pixel_art_settings(self, auto_grid=True, keep_scale=False):
         """Analyze the loaded image or video and set the hybrid grid controls for pixel art.
         auto_grid picks the art-pixel grid from image detail; otherwise the grid control's value is used."""
         video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
@@ -4027,8 +4097,16 @@ class DitherApp(QMainWindow):
                 self.pixel_grid_spin.setValue(cells)
                 self.pixel_grid_spin.blockSignals(False)
                 detail_note = f"detail analysis picked {cells} (keeps {retained:.0%} of detail), "
+            # keep_scale refits the block to the user's own factors instead of the preset's;
+            # the grid is laid over the downscaled-then-upscaled image either way
+            keep_scale = keep_scale or self.consolidating()
+            if keep_scale:
+                width, height = (max(1, n // self.downscale_spin.value()) * self.upsample_spin.value()
+                                 for n in (width, height))
             settings = suggest_pixel_art_settings(thumbnail_array, width, height,
                                                   self.pixel_grid_spin.value())
+            if keep_scale:
+                settings["block_size"] //= settings["upsample"]
         except Exception as e:
             self.status_label.setText(f"Pixel Art Mode: could not analyze file ({e})")
             return
@@ -4039,8 +4117,13 @@ class DitherApp(QMainWindow):
         self.hybrid_cell_spin.setValue(settings["block_size"])
         self.color_mode_combo.setCurrentText(settings["color_mode"])
         self.levels_spin.setValue(settings["levels"])
-        self.upsample_spin.setValue(settings["upsample"])
-        self.downscale_spin.setValue(1)
+        if not keep_scale:
+            self.applying_scale_preset = True
+            try:
+                self.upsample_spin.setValue(settings["upsample"])
+                self.downscale_spin.setValue(1)
+            finally:
+                self.applying_scale_preset = False
 
         grid_w, grid_h = settings["grid"]
         mode = "High Res" if self.get_pixel_art_style() == "high_res" else "Retro"
@@ -4114,12 +4197,64 @@ class DitherApp(QMainWindow):
         self.downscale_label.setText(text)
         self.update_dimensions_text()
 
+    def consolidating(self):
+        """Consolidation only applies when there is both a downscale and an upscale"""
+        return (self.consolidate_check.isChecked() and self.downscale_spin.value() > 1
+                and self.upsample_spin.value() > 1)
+
+    def refit_pixel_art_block(self):
+        """Pixel art sizes its block for the image it dithers; refit it without touching the factors"""
+        if self.get_pixel_art_style() != "off" and self.current_image_path:
+            self.apply_pixel_art_settings(auto_grid=False, keep_scale=True)
+        self.update_dimensions_text()
+
+    def on_consolidate_toggled(self, checked):
+        if not checked and self.downscale_spin.value() > 1 and self.upsample_spin.value() > 1:
+            # Alone, the factors are either/or: keep the one changed last
+            other = self.downscale_spin if self.last_scale_edit is self.upsample_spin else self.upsample_spin
+            other.setValue(1)
+        self.refit_pixel_art_block()
+
+    def on_scale_changed(self, *_):
+        spin = self.sender()
+        if spin not in (self.downscale_spin, self.upsample_spin) or spin.value() <= 1:
+            return
+        self.last_scale_edit = spin
+        if self.consolidate_check.isChecked():
+            self.refit_pixel_art_block()
+            return
+        # Alone, the factors are either/or: switching to one resets the other
+        other = self.upsample_spin if spin is self.downscale_spin else self.downscale_spin
+        if other.value() > 1:
+            other.setValue(1)
+            if not self.applying_scale_preset:
+                self.refit_pixel_art_block()
+
+    def update_scale_controls(self):
+        """Without consolidation, upscaling and downscaling don't mix: highlight the one in use
+        and dim the other, which takes over when set above 1x. Consolidation uses both."""
+        if not hasattr(self, 'downscale_group'):
+            return
+        native_pixels = self.native_pixel_check.isEnabled() and self.native_pixel_check.isChecked()
+        both = self.consolidate_check.isChecked()
+        down, up = self.downscale_spin.value(), self.upsample_spin.value()
+        for group, value, usable, label, restore in (
+                (self.upsample_group, up, both or down == 1, self.upsample_label, self.restore_upscale_check),
+                (self.downscale_group, down, both or up == 1, self.downscale_label, self.restore_size_check)):
+            label.setEnabled(usable)
+            restore.setEnabled(usable and not native_pixels)
+            if group.property('scaleActive') != (value > 1):
+                group.setProperty('scaleActive', value > 1)
+                group.style().unpolish(group)
+                group.style().polish(group)
+
     def update_dimensions_text(self):
         """Show original and projected output dimensions for the loaded image"""
         native_pixels = self.native_pixel_check.isEnabled() and self.native_pixel_check.isChecked()
         for name in ('restore_size_check', 'restore_upscale_check'):
             if hasattr(self, name):
                 getattr(self, name).setEnabled(not native_pixels)
+        self.update_scale_controls()
         if not self.current_image_path:
             return
         video_extensions = ('.mp4', '.avi', '.mov', '.mkv', '.webm', '.flv', '.wmv', '.m4v')
@@ -4160,6 +4295,15 @@ class DitherApp(QMainWindow):
             return
         if upsample == 1 and downscale == 1:
             self.image_label.setText(f"Selected: {name}\nDimensions: {width}x{height} px")
+            return
+        if self.consolidating():
+            consolidated = (max(1, width // downscale) * upsample, max(1, height // downscale) * upsample)
+            restore = self.restore_size_check.isChecked() or self.restore_upscale_check.isChecked()
+            output = (width, height) if restore else consolidated
+            self.image_label.setText(f"Selected: {name}\nOriginal: {width}x{height} px"
+                                     f"\nConsolidated: {width // downscale}x{height // downscale} px, "
+                                     f"then {consolidated[0]}x{consolidated[1]} px"
+                                     f"\nOutput: {output[0]}x{output[1]} px")
             return
 
         restore_upscale = upsample > 1 and self.restore_upscale_check.isChecked()
@@ -4322,7 +4466,8 @@ class DitherApp(QMainWindow):
             neural_fill_holes=self.neural_fill_check.isChecked(),
             depth_strength=self.depth_strength,
             preserve_highlights=self.light_details_check.isChecked(),
-            native_pixel_size=native_pixels
+            native_pixel_size=native_pixels,
+            consolidate=self.consolidate_check.isChecked()
         )
         self.worker_thread.progress.connect(self.update_progress)
         self.worker_thread.finished.connect(self.on_finished)
